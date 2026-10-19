@@ -6,6 +6,8 @@ package redact
 import (
 	"bytes"
 	"encoding/json"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 )
 
 // Report summarises the outcome of a Rewrite call.
@@ -75,6 +77,36 @@ func RewriteJSON(body []byte, m *Matcher, r *Redactor, lim Limits) ([]byte, *Rep
 	// on first-wins upstream parsers).
 	if err := checkNoDuplicateKeys(body); err != nil {
 		return nil, nil, err
+	}
+	// Generic card joins share the scanner's UNION rule. Informational
+	// joins are recorded by DLP and left unchanged by redaction.
+	runs, limit := jsonnumber.CardRunsWithLimit(string(body), lim.MaxDepth+1)
+	if limit == jsonnumber.CardRunDepthLimit {
+		return nil, nil, newBlock(ReasonDepthExceeded, r.Total(), "")
+	}
+	if limit == jsonnumber.CardRunNumberLimit {
+		return nil, nil, newBlock(ReasonSecretInNumericScalar, r.Total(), "JSON number exceeds card inspection budget")
+	}
+	cardEnabled := false
+	if m != nil {
+		for _, p := range m.patterns {
+			cardEnabled = cardEnabled || p.class == ClassCreditCard
+		}
+	}
+	for _, run := range runs {
+		if m == nil {
+			continue
+		}
+		// Explicit dictionaries retain exact known-value enforcement even
+		// when a generic card join is informational.
+		for _, dict := range m.dicts {
+			if dict.pattern.MatchString(run.Digits) {
+				return nil, nil, newBlock(ReasonSecretInNumericScalar, r.Total(), "known value matched JSON scalar values")
+			}
+		}
+		if cardEnabled && run.EnforcesShippedRule() {
+			return nil, nil, newBlock(ReasonSecretInNumericScalar, r.Total(), "card pattern matched JSON scalar values")
+		}
 	}
 
 	var root interface{}
@@ -172,7 +204,7 @@ func (w *walker) walk(node interface{}, depth int) (interface{}, error) {
 		// string placeholder would change the JSON type and almost always
 		// break the upstream API. Bodies that legitimately carry secrets
 		// as bare numbers should use string encoding instead.
-		if matches := w.matcher.Scan(string(v)); len(matches) > 0 {
+		if matches := w.matcher.scanViews(string(v), jsonnumber.IntegralView(v)); len(matches) > 0 {
 			return nil, newBlock(ReasonSecretInNumericScalar, w.redactor.Total(),
 				"secret pattern matched a numeric JSON scalar; encode sensitive values as strings")
 		}

@@ -428,8 +428,8 @@ func TestScanA2ARequestBody_BudgetExceededSkipsUnboundedKeyEntropyPass(t *testin
 	if result.EntropyFinding != nil {
 		t.Fatalf("budget-exceeded payload must not run a second unbounded key entropy pass, got %+v", result.EntropyFinding)
 	}
-	if result.Action != config.ActionWarn {
-		t.Fatalf("Action = %q, want %q from A2A budget finding", result.Action, config.ActionWarn)
+	if result.Action != config.ActionBlock || !strings.Contains(result.ScanError, "maximum distinct leaf count") {
+		t.Fatalf("distinct key budget must fail closed even under warn: %+v", result)
 	}
 }
 
@@ -1511,6 +1511,41 @@ func TestBuildA2AReason_Empty(t *testing.T) {
 	}
 }
 
+// A2A audit events retain only the scan reason. An inspection refusal blocks
+// without consulting a2a_scanning.action, so its hint must not offer that knob.
+func TestA2AJSONInspectionRemediationHint(t *testing.T) {
+	sc := testScannerWithAction(t, config.ActionWarn)
+	cfg := enabledA2ACfg()
+	cfg.Action = config.ActionWarn
+	for _, body := range []string{`[1e10001]`, `[` + strings.Repeat("9", 4097) + `]`} {
+		for _, scan := range []struct {
+			name string
+			run  func([]byte) A2AScanResult
+		}{
+			{"request", func(b []byte) A2AScanResult { return ScanA2ARequestBody(t.Context(), b, sc, cfg) }},
+			{"response", func(b []byte) A2AScanResult { return ScanA2AResponseBody(t.Context(), b, sc, cfg) }},
+		} {
+			v := scan.run([]byte(body))
+			if !v.InspectionIncomplete || !scanner.HasInspectionLimit(v.DLPFindings) {
+				t.Fatalf("%s: inspection refusal not produced: %+v", scan.name, v)
+			}
+			for _, label := range []string{scanner.AuditA2AScan, scanner.AuditA2AResponse} {
+				g, ok := scanner.GuidanceForResult(label, v.Reason)
+				if !ok || !g.Immutable || !strings.Contains(g.OperatorKnob, "limits are fixed") {
+					t.Fatalf("%s %s reason %q: hint %+v", scan.name, label, v.Reason, g)
+				}
+			}
+		}
+	}
+	for _, name := range []string{"ordinary", "prefix " + scanner.UninspectableJSONNumberPattern} {
+		reason := buildA2AReason(A2AScanResult{DLPFindings: []scanner.TextDLPMatch{{PatternName: name}}})
+		g, _ := scanner.GuidanceForResult(scanner.AuditA2AResponse, reason)
+		if g.Immutable || !strings.Contains(g.OperatorKnob, "a2a_scanning.action: warn") {
+			t.Fatalf("ordinary A2A DLP %q changed hint: %+v", reason, g)
+		}
+	}
+}
+
 // --- CardCacheKeyFromRequest ---
 
 func TestCardCacheKeyFromRequest_Unauthenticated(t *testing.T) {
@@ -1945,5 +1980,61 @@ func TestScanA2AHeaders_RepeatedFieldScansEveryLine(t *testing.T) {
 	clean.Add("A2A-Extensions", "https://ext2.example.com")
 	if r := ScanA2AHeaders(context.Background(), clean, testA2AScanner(t), enabledA2ACfg()); !r.Clean {
 		t.Fatalf("benign repeated lines flagged: %s", r.Reason)
+	}
+}
+
+func TestA2AJSONInspectionRemediationDuplicateKey(t *testing.T) {
+	sc := testScannerWithAction(t, config.ActionWarn)
+	cfg := enabledA2ACfg()
+	cfg.Action = config.ActionWarn
+	key := "x; DLP: " + scanner.UninspectableJSONNumberPattern + "; tail"
+	body := []byte(fmt.Sprintf(`{%q:1,%q:2}`, key, key))
+	for _, scan := range []struct {
+		name string
+		run  func([]byte) A2AScanResult
+	}{
+		{"request", func(b []byte) A2AScanResult { return ScanA2ARequestBody(t.Context(), b, sc, cfg) }},
+		{"response", func(b []byte) A2AScanResult { return ScanA2AResponseBody(t.Context(), b, sc, cfg) }},
+	} {
+		v := scan.run(body)
+		if !v.InspectionIncomplete || v.Action != config.ActionBlock || len(v.DLPFindings) != 0 {
+			t.Fatalf("expected duplicate-key refusal without DLP findings: %+v", v)
+		}
+		for _, label := range []string{scanner.AuditA2AScan, scanner.AuditA2AHeader, scanner.AuditA2AResponse} {
+			g, ok := scanner.GuidanceForResult(label, v.Reason)
+			if !ok || g.Immutable || !strings.Contains(g.OperatorKnob, "Correct the malformed") {
+				t.Errorf("%s %s: client duplicate key selected number-limit guidance: %+v", scan.name, label, g)
+			}
+		}
+	}
+}
+
+func TestA2AJSONInspectionRemediationOrdinaryProducer(t *testing.T) {
+	scannerCfg := config.Defaults()
+	scannerCfg.Internal = nil
+	scannerCfg.DLP.Patterns = []config.DLPPattern{{Name: "ordinary", Regex: "review_ordinary_marker", Severity: config.SeverityHigh}}
+	sc := scanner.MustNew(scannerCfg)
+	t.Cleanup(sc.Close)
+	cfg := enabledA2ACfg()
+	cfg.Action = config.ActionWarn
+	for _, body := range []string{
+		`{"method":"review_ordinary_marker; DLP: Uninspectable JSON number; tail"}`,
+		`{"review_ordinary_marker; DLP: Uninspectable JSON number; tail":"safe"}`,
+	} {
+		for _, scan := range []func() A2AScanResult{
+			func() A2AScanResult { return ScanA2ARequestBody(t.Context(), []byte(body), sc, cfg) },
+			func() A2AScanResult { return ScanA2AResponseBody(t.Context(), []byte(body), sc, cfg) },
+		} {
+			result := scan()
+			if result.Clean || result.InspectionIncomplete || len(result.DLPFindings) == 0 || result.Action != config.ActionWarn {
+				t.Fatalf("ordinary producer did not emit a completed warn finding: %+v", result)
+			}
+			for _, label := range []string{scanner.AuditA2AScan, scanner.AuditA2AHeader, scanner.AuditA2AResponse} {
+				g, ok := scanner.GuidanceForResult(label, result.Reason)
+				if !ok || g.Immutable || !strings.Contains(g.OperatorKnob, "a2a_scanning.action: warn") {
+					t.Fatalf("ordinary producer reason %q changed hint: %+v", result.Reason, g)
+				}
+			}
+		}
 	}
 }

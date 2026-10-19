@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/a2amethods"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/provenance"
@@ -234,6 +235,36 @@ type toolPrescan struct {
 	spans  []toolTextSpan
 	norm   string
 	poison []string
+	// spacedNorm is the spaced view of text, and spacedPoison holds the
+	// findings only that view shows: words joined across a line break or
+	// invisible separator in norm.
+	spacedNorm   string
+	spacedPoison []string
+}
+
+// hasCredentialRequest reports whether either view raised the Credential
+// Request Directive.
+func (pre toolPrescan) hasCredentialRequest() bool {
+	return slices.Contains(pre.poison, handoverRequestFinding) || pre.credentialRequestSpacedOnly()
+}
+
+// credentialRequestSpacedOnly reports whether only the spaced view raised the
+// Credential Request Directive.
+func (pre toolPrescan) credentialRequestSpacedOnly() bool {
+	return !slices.Contains(pre.poison, handoverRequestFinding) && slices.Contains(pre.spacedPoison, handoverRequestFinding)
+}
+
+// credentialRequestAttribution attributes the Credential Request Directive
+// matches in the view that raised the finding: the stripped view when it
+// did, otherwise the spaced view. Candidates and configured entries both use
+// it, so an entry is checked in the view its candidate was built from. The
+// entry also binds the complete tool digest, so the same definition always
+// selects the same view.
+func (pre toolPrescan) credentialRequestAttribution() credentialRequestAttribution {
+	if pre.credentialRequestSpacedOnly() {
+		return attributeView(pre.text, pre.spacedNorm, pre.spans, normalize.ForToolTextSpaced)
+	}
+	return attributeWithNorm(pre.text, pre.norm, pre.spans)
 }
 
 func prescanTool(cfg *ToolScanConfig, tool ToolDef) toolPrescan {
@@ -242,8 +273,31 @@ func prescanTool(cfg *ToolScanConfig, tool ToolDef) toolPrescan {
 	if text != "" {
 		pre.norm = normalize.ForToolText(text)
 		pre.poison = checkToolPoison(pre.norm)
+		pre.spacedNorm = normalize.ForToolTextSpaced(text)
+		pre.spacedPoison = spacedOnlyToolPoison(pre.spacedNorm, pre.norm, pre.poison)
 	}
 	return pre
+}
+
+// checkSpacedToolPoison returns the tool-poison findings of the spaced view
+// of text that are not already in found, the findings of its stripped view.
+func checkSpacedToolPoison(text, norm string, found []string) []string {
+	return spacedOnlyToolPoison(normalize.ForToolTextSpaced(text), norm, found)
+}
+
+// spacedOnlyToolPoison returns the tool-poison findings of spaced, the spaced
+// view, that are not already in found, the findings of norm.
+func spacedOnlyToolPoison(spaced, norm string, found []string) []string {
+	if spaced == norm {
+		return nil
+	}
+	var extra []string
+	for _, name := range checkToolPoison(spaced) {
+		if !slices.Contains(found, name) {
+			extra = append(extra, name)
+		}
+	}
+	return extra
 }
 
 func (c *ToolScanConfig) now() time.Time {
@@ -1526,7 +1580,7 @@ func extractToolRuleDescriptionText(t ToolDef) string {
 	}
 	if len(t.InputSchema) > 0 {
 		var schema any
-		if json.Unmarshal(t.InputSchema, &schema) == nil {
+		if extract.DecodeJSON(t.InputSchema, &schema) == nil {
 			collectSchemaDescriptionFields(schema, &parts, 0)
 		}
 	}
@@ -1725,7 +1779,7 @@ func toolKeyExtractionTruncated(raw json.RawMessage) bool {
 
 func toolFieldContainsOpaqueMedia(raw json.RawMessage) bool {
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
 		return false
 	}
 	return valueContainsOpaqueToolMedia(parsed)
@@ -1898,7 +1952,7 @@ func expandParamName(name string) string {
 // definitions, items, and additionalProperties). Returns sorted, deduplicated names.
 func ExtractParamNames(schema json.RawMessage) []string {
 	var parsed map[string]interface{}
-	if err := json.Unmarshal(schema, &parsed); err != nil {
+	if err := extract.DecodeJSON(schema, &parsed); err != nil {
 		return nil
 	}
 	seen := make(map[string]bool)
@@ -1949,7 +2003,7 @@ func ExtractSchemaDescriptions(schema json.RawMessage) []string {
 
 func schemaDescriptionsOrdered(schema json.RawMessage, order schemaKeyOrder) []string {
 	var parsed interface{}
-	if err := json.Unmarshal(schema, &parsed); err != nil {
+	if err := extract.DecodeJSON(schema, &parsed); err != nil {
 		return nil
 	}
 	sink := toolTextSink{order: order}
@@ -1963,7 +2017,7 @@ func schemaDescriptionsOrdered(schema json.RawMessage, order schemaKeyOrder) []s
 // as clean merely because the more general JSON extractor can traverse it.
 func schemaTextExtractionTruncated(schema json.RawMessage) bool {
 	var parsed interface{}
-	if err := json.Unmarshal(schema, &parsed); err != nil {
+	if err := extract.DecodeJSON(schema, &parsed); err != nil {
 		return false
 	}
 	return schemaValueDepthTruncated(parsed, 0)
@@ -2706,7 +2760,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 		directiveKeys := extractToolDirectiveKeys(tool)
 
 		pre := prescans[toolIndex]
-		text, spans := pre.text, pre.spans
+		text := pre.text
 
 		if text == "" {
 			// A reviewed tool can shrink to no scanner text at all. Its entry
@@ -2729,9 +2783,9 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 
 			// Tool-specific poisoning patterns on normalized text.
 			// Normalization prevents zero-width char and confusable bypasses.
-			norm := pre.norm
 			poison := slices.Clone(pre.poison)
-			hasRequest := slices.Contains(poison, handoverRequestFinding)
+			spacedPoison := slices.Clone(pre.spacedPoison)
+			hasRequest := pre.hasCredentialRequest()
 			// A configured entry is evaluated whether or not its finding is
 			// still present: a reviewed tool whose wording changed or was
 			// removed no longer matches the entry, and that must refuse rather
@@ -2740,17 +2794,19 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 			hasEntry := outcome != ""
 			if hasRequest || hasEntry {
 				// The attribution reads the exact text, spans and normalized
-				// string checkToolPoison just matched.
-				att := attributeWithNorm(text, norm, spans)
+				// view whose match raised the finding.
+				att := pre.credentialRequestAttribution()
 				switch {
 				case !hasEntry:
-					match.CredentialAckCandidate, match.CredentialAckUnsupported = credentialAckCandidate(cfg, tool, att)
+					match.CredentialAckCandidate, match.CredentialAckUnsupported = requestAckCandidate(cfg, tool, pre, att)
 				default:
 					match.CredentialAck = outcome
 					if outcome == CredentialAckAcknowledged {
 						// Only this finding is lifted. The raw finding and its
 						// treatment stay visible as an observation for audit.
-						poison = slices.DeleteFunc(slices.Clone(poison), func(f string) bool { return f == handoverRequestFinding })
+						isRequest := func(f string) bool { return f == handoverRequestFinding }
+						poison = slices.DeleteFunc(poison, isRequest)
+						spacedPoison = slices.DeleteFunc(spacedPoison, isRequest)
 						observations = append(observations, ToolScanMatch{
 							ToolName:      tool.Name,
 							ToolPoison:    []string{handoverRequestFinding},
@@ -2759,11 +2815,12 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 					} else {
 						hasFinding = true
 						if hasRequest {
-							match.CredentialAckCandidate, match.CredentialAckUnsupported = credentialAckCandidate(cfg, tool, att)
+							match.CredentialAckCandidate, match.CredentialAckUnsupported = requestAckCandidate(cfg, tool, pre, att)
 						}
 					}
 				}
 			}
+			poison = append(poison, spacedPoison...)
 			if len(poison) > 0 {
 				match.ToolPoison = append(match.ToolPoison, poison...)
 				hasFinding = true
@@ -2803,13 +2860,15 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 
 			// Community rule bundle extra-poison patterns.
 			if cfg != nil && len(cfg.ExtraPoison) > 0 {
-				normName := normalize.ForToolText(tool.Name)
-				normDesc := normalize.ForToolText(extractToolRuleDescriptionText(tool))
+				name := tool.Name
+				desc := extractToolRuleDescriptionText(tool)
+				normName := [2]string{normalize.ForToolText(name), normalize.ForToolTextSpaced(name)}
+				normDesc := [2]string{normalize.ForToolText(desc), normalize.ForToolTextSpaced(desc)}
 				for _, ep := range cfg.ExtraPoison {
 					if ep == nil || ep.Re == nil || ep.Name == "" {
 						continue
 					}
-					var target string
+					var target [2]string
 					switch ep.ScanField {
 					case "name":
 						target = normName
@@ -2818,7 +2877,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 					default:
 						continue
 					}
-					if ep.Re.MatchString(target) {
+					if ep.Re.MatchString(target[0]) || ep.Re.MatchString(target[1]) {
 						match.ToolPoison = append(match.ToolPoison, ep.Name)
 						hasFinding = true
 					}

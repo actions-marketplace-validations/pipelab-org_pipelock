@@ -91,6 +91,96 @@ func (c *sseCancelOnErrContext) Err() error {
 
 // --- Happy paths: real-world LLM provider SSE shapes ---
 
+func TestGenericSSEJSONCardNumberContext(t *testing.T) {
+	card := "41111111" + "11111111"
+	groups := "4111,1111" + ",1111,1111"
+	// Number-only runs forward under the default block action, but only with
+	// an operator record; every other card shape keeps blocking the stream.
+	for _, tt := range []struct {
+		name, event string
+		clean, warn bool
+	}{
+		{"ids", `{"ids":[` + groups + `]}`, true, true},
+		{"bbox", `{"bbox":[` + groups + `]}`, true, true},
+		{"root groups", `[` + groups + `]`, true, true},
+		{"empty key", `{"": [` + groups + `]}`, true, true},
+		{"dash key", `{"-": [` + groups + `]}`, true, true},
+		{"prefix key", `{"x-": [` + groups + `]}`, true, true},
+		{"fraction", `{"n":0.` + card + `}`, true, false},
+		{"structured fraction with whitespace", "  {\"n\":0." + card + `}`, true, false},
+		{"scalar decimal", "0." + card, false, false},
+		{"scalar decimal with whitespace", " 0." + card, false, false},
+		{"card string", `{"n":"` + card + `"}`, false, false},
+		{"card integer", `{"n":` + card + `}`, false, false},
+		{"integer component", `{"n":` + card + `.1}`, false, false},
+		{"number run beside card string", `{"ids":[` + groups + `],"n":"` + card + `"}`, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := testA2AScanner(t)
+			t.Cleanup(s.Close)
+			stream := "data: " + tt.event + "\n\ndata: " + tt.event + "\n\n"
+			var out bytes.Buffer
+			var records []error
+			err := ScanGenericSSEStreamWithOptions(t.Context(), strings.NewReader(stream), &out, nil, s, enabledSSECfg(), GenericSSEScanOptions{
+				OnFinding: func(err error) { records = append(records, err) },
+			})
+			if (err == nil) != tt.clean {
+				t.Fatalf("case=%s error=%v want clean=%v", tt.name, err, tt.clean)
+			}
+			if tt.clean && out.String() != stream {
+				t.Fatalf("clean event changed: %q", out.String())
+			}
+			if tt.warn != (len(records) > 0) {
+				t.Fatalf("case=%s records=%v want warn=%v", tt.name, records, tt.warn)
+			}
+		})
+	}
+}
+
+func TestGenericSSEPlainTextCard(t *testing.T) {
+	card := "41111111" + "11111111"
+	s := testA2AScanner(t)
+	t.Cleanup(s.Close)
+	stream := "data: " + card + "\n\n"
+	var out bytes.Buffer
+	if err := ScanGenericSSEStream(t.Context(), strings.NewReader(stream), &out, nil, s, enabledSSECfg()); err == nil {
+		t.Fatal("plain-text card was not detected")
+	}
+}
+
+func TestGenericSSECardAcrossEvents(t *testing.T) {
+	first := "4111" + "1111"
+	last := "1111" + "1111"
+	for _, tt := range []struct {
+		name, firstEvent, lastEvent string
+		wantFinding                 bool
+	}{
+		{"bare digits", first, last, true},
+		{"text then bare digits", "card " + first, last, true},
+		// Separate JSON numbers joined across the seam are number-only:
+		// forwarded with an operator record rather than denied.
+		{"integer arrays", `[` + first + `]`, `[` + last + `]`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := testA2AScanner(t)
+			t.Cleanup(s.Close)
+			stream := "data: " + tt.firstEvent + "\n\ndata: " + tt.lastEvent + "\n\n"
+			var forwarded bytes.Buffer
+			var records []error
+			err := ScanGenericSSEStreamWithOptions(t.Context(), strings.NewReader(stream), &forwarded, nil, s, enabledSSECfg(), GenericSSEScanOptions{
+				OnFinding: func(err error) { records = append(records, err) },
+			})
+			if tt.wantFinding {
+				if !errors.Is(err, ErrSSEStreamFinding) {
+					t.Fatalf("cross-event card was not denied: %v", err)
+				}
+			} else if err != nil || forwarded.String() != stream || len(records) == 0 {
+				t.Fatalf("number-only seam lost its record or changed: error=%v records=%v forwarded=%q", err, records, forwarded.String())
+			}
+		})
+	}
+}
+
 func TestScanGenericSSEStream_OpenAI_HappyPath(t *testing.T) {
 	// Realistic openai chat.completions stream: a few delta tokens then [DONE].
 	body := strings.Join([]string{

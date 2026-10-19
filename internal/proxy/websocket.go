@@ -31,7 +31,9 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/httpstream"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
@@ -214,7 +216,7 @@ func (r *wsRelay) blockOnCredentialAudienceReceiptFailure(log *audit.Logger, err
 		RequestID: r.requestID,
 		Agent:     r.agent,
 	})
-	closePayload := blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).CloseFramePayload()
+	closePayload := blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(r.requestID).CloseFramePayload()
 	plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, closePayload)
 	plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, closePayload)
 	return true
@@ -334,7 +336,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedError(w,
-			blockInfoFor(blockreason.EnvelopeVerifyFailed, blockLayerMediationEnvelope),
+			blockInfoFor(blockreason.EnvelopeVerifyFailed, blockLayerMediationEnvelope).WithRequestID(requestID),
 			"inbound mediation envelope verification failed", http.StatusForbidden)
 		return
 	}
@@ -346,7 +348,6 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer releaseScanner()
 	r, correlation := attachRequestCorrelation(r, cfg, sc)
 	if !scOK {
-		_, requestID := requestMeta(r)
 		p.recordDecision(config.ActionBlock, scannerLabelUnavailable, scannerPatternUnavailable, TransportWS, requestID)
 		emitWebSocketReceipt(receipt.EmitOpts{
 			ActionID:  receipt.NewActionID(),
@@ -360,14 +361,14 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedError(w,
-			blockInfoFor(blockreason.PatternUnavailable, scannerLabelUnavailable),
+			blockInfoFor(blockreason.PatternUnavailable, scannerLabelUnavailable).WithRequestID(requestID),
 			scannerPatternUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 
 	if !cfg.WebSocketProxy.Enabled {
 		writeBlockedError(w,
-			blockInfoFor(blockreason.NotEnabled, ""),
+			blockInfoFor(blockreason.NotEnabled, "").WithRequestID(requestID),
 			"WebSocket proxy not enabled", http.StatusNotFound)
 		return
 	}
@@ -379,7 +380,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	targetURL := extractTargetURL(r)
 	if targetURL == "" {
 		writeBlockedError(w,
-			blockInfoFor(blockreason.BadRequest, ""),
+			blockInfoFor(blockreason.BadRequest, "").WithRequestID(requestID),
 			"missing 'url' query parameter", http.StatusBadRequest)
 		return
 	}
@@ -389,7 +390,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	parsed, err := url.Parse(targetURL)
 	if err != nil || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
 		writeBlockedError(w,
-			blockInfoFor(blockreason.SchemeBlocked, scanner.ScannerScheme),
+			blockInfoFor(blockreason.SchemeBlocked, scanner.ScannerScheme).WithRequestID(requestID),
 			"invalid URL: must be ws or wss", http.StatusBadRequest)
 		return
 	}
@@ -419,7 +420,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		blockedErr := newCredentialAudienceReceiptBlockedRequest(err)
 		log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 		writeBlockedError(w,
-			blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer),
+			blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(requestID),
 			"blocked: "+blockedErr.reason, http.StatusForbidden)
 		return
 	}
@@ -495,7 +496,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if cfg.ExplainBlocksEnabled() && result.Hint != "" {
 				w.Header().Set("X-Pipelock-Hint", result.Hint)
 			}
-			writeBlockedError(w, blockInfoForResult(result),
+			writeBlockedError(w, blockInfoForResult(result).WithRequestID(requestID),
 				"WebSocket blocked: "+result.Reason, status)
 			return
 		}
@@ -521,7 +522,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				RequestID: requestID,
 				Agent:     agent,
 			})
-			writeBlockedError(w, blockInfoForResult(result),
+			writeBlockedError(w, blockInfoForResult(result).WithRequestID(requestID),
 				"WebSocket "+adaptiveBlockedReason, status)
 			return
 		}
@@ -547,7 +548,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedError(w,
-			info, sr.Detail, status)
+			info.WithRequestID(requestID), sr.Detail, status)
 		return
 	}
 
@@ -569,7 +570,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedError(w,
-			blockInfoFor(blockreason.EscalationLevel, ""),
+			blockInfoFor(blockreason.EscalationLevel, "").WithRequestID(requestID),
 			"WebSocket "+adaptiveBlockedReason,
 			http.StatusForbidden)
 		return
@@ -593,7 +594,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedError(w,
-			blockInfoFor(blockreason.RateLimit, scanner.ScannerRateLimit),
+			blockInfoFor(blockreason.RateLimit, scanner.ScannerRateLimit).WithRequestID(requestID),
 			"WebSocket blocked: "+reason, http.StatusTooManyRequests)
 		return
 	}
@@ -602,7 +603,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	sem := getWSSemaphore(cfg.WebSocketProxy.MaxConcurrentConnections)
 	if !sem.TryAcquire() {
 		writeBlockedError(w,
-			blockInfoFor(blockreason.RateLimit, scanner.ScannerRateLimit),
+			blockInfoFor(blockreason.RateLimit, scanner.ScannerRateLimit).WithRequestID(requestID),
 			"too many active WebSocket connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -618,7 +619,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		blockedErr := newCredentialAudienceReceiptBlockedRequest(wsHeaderReceiptErr)
 		log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 		writeBlockedError(w,
-			blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer),
+			blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(requestID),
 			"blocked: "+blockedErr.reason, http.StatusForbidden)
 		return
 	}
@@ -694,7 +695,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				RequestID: requestID,
 				Agent:     agent,
 			})
-			writeBlockedError(w, info, headerSR.Detail, status)
+			writeBlockedError(w, info.WithRequestID(requestID), headerSR.Detail, status)
 			return
 		}
 		if wsHeaderBlocked {
@@ -716,7 +717,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				Agent:     agent,
 			})
 			writeBlockedError(w,
-				blockInfoFor(blockreason.DLPMatch, "dlp_header"),
+				blockInfoFor(blockreason.DLPMatch, "dlp_header").WithRequestID(requestID),
 				"WebSocket blocked: "+reason, http.StatusForbidden)
 			return
 		}
@@ -739,7 +740,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				Agent:     agent,
 			})
 			writeBlockedError(w,
-				blockInfoFor(blockreason.EscalationLevel, ""),
+				blockInfoFor(blockreason.EscalationLevel, "").WithRequestID(requestID),
 				"WebSocket "+adaptiveBlockedReason,
 				http.StatusForbidden)
 			return
@@ -783,7 +784,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				Agent:      agent,
 			})
 			writeBlockedError(w,
-				blockInfoFor(blockreason.CrossRequestDeny, "cross_request"),
+				blockInfoFor(blockreason.CrossRequestDeny, "cross_request").WithRequestID(requestID),
 				"WebSocket blocked: "+ceeRes.Reason, http.StatusForbidden)
 			return
 		}
@@ -801,7 +802,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 					Method: http.MethodGet, Target: targetURL, RequestID: requestID, Agent: agent,
 				})
 				p.metrics.RecordWSBlocked()
-				writeBlockedError(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer), session.ErrCapacity.Error(), http.StatusServiceUnavailable)
+				writeBlockedError(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer).WithRequestID(requestID), session.ErrCapacity.Error(), http.StatusServiceUnavailable)
 				return
 			}
 			level := recEscalationLevel(ceeRec)
@@ -820,7 +821,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				Agent:      agent,
 			})
 			writeBlockedError(w,
-				blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny),
+				blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny).WithRequestID(requestID),
 				"WebSocket "+adaptiveBlockedReason, http.StatusForbidden)
 			return
 		}
@@ -849,7 +850,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		DeferBodyPredicate: true,
 	}); rpRes.Block {
 		p.metrics.RecordWSBlocked()
-		writeBlockedError(w, rpRes.Info, "WebSocket blocked by request policy: "+rpRes.Reason, http.StatusForbidden)
+		writeBlockedError(w, rpRes.Info.WithRequestID(requestID), "WebSocket blocked by request policy: "+rpRes.Reason, http.StatusForbidden)
 		return
 	}
 
@@ -887,7 +888,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			RequestID: requestID,
 			Agent:     agent,
 		}))
-		writeGateBlockedError(w, gate, "WebSocket blocked: "+reason)
+		writeGateBlockedError(w, gate, "WebSocket blocked: "+reason, requestID)
 		return
 	}
 
@@ -949,9 +950,9 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				RequestID: requestID, Agent: agent,
 			})
 			if clientConn != nil {
-				plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation, info.CloseFramePayload())
+				plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation, info.WithRequestID(requestID).CloseFramePayload())
 			} else {
-				writeBlockedError(w, info, session.ErrCapacity.Error(), http.StatusServiceUnavailable)
+				writeBlockedError(w, info.WithRequestID(requestID), session.ErrCapacity.Error(), http.StatusServiceUnavailable)
 			}
 			return
 		}
@@ -982,10 +983,10 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			})
 			if clientConn != nil {
 				plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation,
-					blockInfoFor(blockreason.AirlockActive, "").CloseFramePayload())
+					blockInfoFor(blockreason.AirlockActive, "").WithRequestID(requestID).CloseFramePayload())
 			} else {
 				writeBlockedError(w,
-					blockInfoFor(blockreason.AirlockActive, ""),
+					blockInfoFor(blockreason.AirlockActive, "").WithRequestID(requestID),
 					"WebSocket blocked: airlock: WebSocket blocked during quarantine", http.StatusForbidden)
 			}
 			return
@@ -1010,10 +1011,10 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		p.metrics.RecordWSBlocked()
 		if clientConn != nil {
 			plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation,
-				blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority).CloseFramePayload())
+				blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority).WithRequestID(requestID).CloseFramePayload())
 		} else {
 			writeBlockedError(w,
-				blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+				blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority).WithRequestID(requestID),
 				"WebSocket blocked: authority verification failed", http.StatusForbidden)
 		}
 		return
@@ -1064,10 +1065,10 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			})
 			if clientConn != nil {
 				plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation,
-					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).CloseFramePayload())
+					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).WithRequestID(requestID).CloseFramePayload())
 			} else {
 				writeBlockedError(w,
-					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer),
+					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).WithRequestID(requestID),
 					"WebSocket blocked: "+blockedErr.reason, http.StatusForbidden)
 			}
 			return
@@ -1103,10 +1104,10 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			})
 			if clientConn != nil {
 				plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation,
-					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).CloseFramePayload())
+					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).WithRequestID(requestID).CloseFramePayload())
 			} else {
 				writeBlockedError(w,
-					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer),
+					blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).WithRequestID(requestID),
 					"WebSocket blocked: "+blockedErr.reason, http.StatusForbidden)
 			}
 			return
@@ -1119,7 +1120,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 			p.metrics.RecordWSBlocked()
 			writeBlockedError(w,
-				blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer),
+				blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(requestID),
 				"WebSocket blocked: "+blockedErr.reason, http.StatusForbidden)
 			return
 		}
@@ -1170,7 +1171,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				RequestID: requestID,
 				Agent:     agent,
 			})
-			plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation, ssrfErr.blockInfo().CloseFramePayload())
+			plwsutil.WriteCloseFrame(clientConn, ws.StatusPolicyViolation, ssrfErr.blockInfo().WithRequestID(requestID).CloseFramePayload())
 			outcomeStatus = strconv.Itoa(int(ws.StatusPolicyViolation))
 			outcomeBytes = 0
 			outcomeReason = string(ssrfErr.reason)
@@ -1673,7 +1674,7 @@ func (r *wsRelay) applyFrameRequestPolicy(log *audit.Logger, msg []byte) bool {
 	if !res.Block {
 		return false
 	}
-	payload := res.Info.CloseFramePayload()
+	payload := res.Info.WithRequestID(r.requestID).CloseFramePayload()
 	plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, payload)
 	plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, payload)
 	return true
@@ -1757,8 +1758,10 @@ func (r *wsRelay) enforceClientControlPayload(ctx context.Context, log *audit.Lo
 }
 
 func (r *wsRelay) enforceClientCEE(ctx context.Context, log *audit.Logger, msg []byte, includeFragments bool) bool {
+	fragmentLeaves, fragmentPayloads, partitionReason := r.clientCEEFragmentLeaves(msg, includeFragments)
 	ceeAdmission := r.proxy.admitCurrentCEE(ctx, ceeAdmitRequest{
 		ActorAuth: r.actorAuth, Outbound: msg,
+		BodyFragmentPayloads: fragmentPayloads, BodyFragmentLeaves: fragmentLeaves, PartitionReason: partitionReason,
 		TargetURL: r.targetURL, Agent: r.agent, ClientIP: r.clientIP, RequestID: r.requestID,
 		IncludeFragments: includeFragments,
 	})
@@ -1790,7 +1793,8 @@ func (r *wsRelay) enforceClientCEE(ctx context.Context, log *audit.Logger, msg [
 			PolicyHash: ceeAdmission.PolicyHash, Pattern: ceeReceiptPattern(ceeRes), Transport: TransportWS,
 			Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
 		})
-		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+			blockInfoFor(blockreason.CrossRequestDeny, "cross_request").WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
 		return true
 	}
@@ -1809,11 +1813,38 @@ func (r *wsRelay) enforceClientCEE(ctx context.Context, log *audit.Logger, msg [
 				RequestID: r.requestID, Agent: r.agent, PolicyHash: ceeAdmission.PolicyHash,
 			})
 		})
-		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+			blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny).WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
 		return true
 	}
 	return false
+}
+
+// clientCEEFragmentLeaves partitions a JSON text message into the same keyed
+// per-field leaves cross-request detection uses for JSON request bodies, so a
+// value split across messages (or connections) is reassembled per field
+// instead of across the JSON envelope. Non-JSON messages keep only the raw
+// outbound stream, exactly as before.
+func (r *wsRelay) clientCEEFragmentLeaves(msg []byte, text bool) (map[string][]ceeJSONLeaf, map[string][]byte, string) {
+	if !text || r.proxy == nil || !wsMessageLooksLikeJSON(msg) || !ceeJSONBodyPartitioningEnabled(r.proxy.cfgPtr.Load()) {
+		return nil, nil, ""
+	}
+	var partitionKey []byte
+	if fb := r.proxy.fragmentBufferPtr.Load(); fb != nil {
+		partitionKey = fb.PartitionKey()
+	}
+	sessionKey := ceeSessionKey(r.cfg, r.agent, r.clientIP, r.actorAuth)
+	leaves, reason := jsonBodyFragmentLeaves(contentTypeJSON, msg, sessionKey, partitionKey)
+	return leaves, concatCEEJSONLeaves(leaves), reason
+}
+
+// wsMessageLooksLikeJSON reports whether msg starts like a JSON object or
+// array. Plain-text messages are not partitioned and must not be counted as
+// malformed JSON.
+func wsMessageLooksLikeJSON(msg []byte) bool {
+	trimmed := bytes.TrimLeft(msg, " \t\r\n")
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
 }
 
 func updateWSCrossMessageTail(tail []byte, msg []byte) []byte {
@@ -1831,14 +1862,30 @@ func updateWSCrossMessageTail(tail []byte, msg []byte) []byte {
 }
 
 func (r *wsRelay) scanClientText(ctx context.Context, log *audit.Logger, scanInput []byte) (blocked bool) {
-	dlpResult := r.scanner.ScanTextForDLP(ctx, string(scanInput))
+	return r.scanClientTextWithCardView(ctx, log, scanInput, scanInput)
+}
+
+func (r *wsRelay) scanClientTextWithCardView(ctx context.Context, log *audit.Logger, scanInput, cardInput []byte) (blocked bool) {
+	dlpResult := r.scanner.ScanTextForDLPWithCardView(ctx, string(scanInput), string(cardInput))
+	return r.handleClientTextResult(log, scanInput, dlpResult, false)
+}
+
+func (r *wsRelay) scanClientNumberText(ctx context.Context, log *audit.Logger, text, cards []byte) bool {
+	result := r.scanner.ScanTextForDLPWithTypedCardView(ctx, string(text), string(cards))
+	return r.handleClientTextResult(log, text, result, true)
+}
+
+func (r *wsRelay) handleClientTextResult(log *audit.Logger, scanInput []byte, dlpResult scanner.TextDLPResult, crossMessage bool) bool {
 	filteredMatches, audienceAllows := r.scanner.FilterTextDLPMatchesForDestination(dlpResult.Matches, r.targetURL, "websocket_frame")
-	dlpResult.Matches = r.filterClientFrameDLPMatches(filteredMatches)
 	for _, allow := range audienceAllows {
 		if err := r.recordCredentialAudienceAllow(allow); err != nil {
 			return r.blockOnCredentialAudienceReceiptFailure(log, err)
 		}
 	}
+	if crossMessage && r.blockCrossMessageRedaction(log, filteredMatches) {
+		return true
+	}
+	dlpResult.Matches = r.filterClientFrameDLPMatches(filteredMatches)
 	var addrFindings []addressprotect.Finding
 	if checker := r.scanner.AddressChecker(); checker != nil {
 		addrFindings = checker.CheckText(string(scanInput), r.agent).Findings
@@ -1848,6 +1895,10 @@ func (r *wsRelay) scanClientText(ctx context.Context, log *audit.Logger, scanInp
 }
 
 func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Logger, tail []byte, msg []byte) (blocked bool) {
+	return r.scanClientCrossMessageTextViews(ctx, log, tail, msg, tail, msg)
+}
+
+func (r *wsRelay) scanClientCrossMessageTextViews(ctx context.Context, log *audit.Logger, tail, msg, cardTail, cardMsg []byte) (blocked bool) {
 	if len(tail) == 0 {
 		return false
 	}
@@ -1856,9 +1907,9 @@ func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Log
 	combined = append(combined, tail...)
 	combined = append(combined, msg...)
 
-	combinedDLP := r.scanner.ScanTextForDLPQuiet(ctx, string(combined))
-	prevDLP := r.scanner.ScanTextForDLPQuiet(ctx, string(tail))
-	currDLP := r.scanner.ScanTextForDLPQuiet(ctx, string(msg))
+	combinedDLP := r.scanner.ScanTextForDLPQuietWithCardView(ctx, string(combined), string(cardTail)+string(cardMsg))
+	prevDLP := r.scanner.ScanTextForDLPQuietWithCardView(ctx, string(tail), string(cardTail))
+	currDLP := r.scanner.ScanTextForDLPQuietWithCardView(ctx, string(msg), string(cardMsg))
 
 	crossDLP, crossWarns := wsCrossMessageDLPMatches(combinedDLP, prevDLP, currDLP)
 	if joined, ok := joinLabeledWSCrossMessageSuffixes(tail, msg); ok {
@@ -1885,7 +1936,16 @@ func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Log
 			crossAddr = wsCrossMessageAddressFindings(combinedAddr.Findings, prevAddr.Findings, currAddr.Findings)
 		}
 	}
-	if r.redaction != nil && r.redaction.required && len(crossDLP) > 0 {
+	if r.blockCrossMessageRedaction(log, crossDLP) {
+		return true
+	}
+
+	crossDLP = r.filterClientFrameDLPMatches(crossDLP)
+	return r.handleClientTextFindings(log, crossDLP, crossAddr)
+}
+
+func (r *wsRelay) blockCrossMessageRedaction(log *audit.Logger, matches []scanner.TextDLPMatch) bool {
+	if r.redaction != nil && r.redaction.required && len(matches) > 0 && !scanner.OnlyInformational(matches) {
 		reason := "redaction blocked request: websocket cross-message secret cannot be redacted"
 		r.recordFinding(session.SignalBlock, log, scannerLabelRedaction, reason)
 		log.LogWSBlocked(audit.WSBlockedEvent{
@@ -1907,13 +1967,12 @@ func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Log
 			RedactionProfile: r.cfg.Redaction.DefaultProfile,
 		})
 		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
-			blockInfoFor(blockreason.RedactionFailure, scannerLabelRedaction).CloseFramePayload())
+			blockInfoFor(blockreason.RedactionFailure, scannerLabelRedaction).WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "cross-message secret cannot be redacted")
 		return true
 	}
 
-	crossDLP = r.filterClientFrameDLPMatches(crossDLP)
-	return r.handleClientTextFindings(log, crossDLP, crossAddr)
+	return false
 }
 
 func (r *wsRelay) filterClientFrameDLPMatches(matches []scanner.TextDLPMatch) []scanner.TextDLPMatch {
@@ -1998,7 +2057,8 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 		}
 		wsBundleRules := dlpBundleRules(dlpMatches)
 		hardBlock := shouldHardBlockCriticalDLP(dlpMatches, r.cfg.EnforceEnabled())
-		if hardBlock || r.cfg.EnforceEnabled() {
+		numberOnly := scanner.OnlyInformational(dlpMatches)
+		if hardBlock || (r.cfg.EnforceEnabled() && !numberOnly) {
 			reason := fmt.Sprintf("DLP match: %s", strings.Join(names, ", "))
 			r.recordFinding(session.SignalBlock, log, scanner.ScannerDLP, reason)
 			log.LogWSBlocked(audit.WSBlockedEvent{
@@ -2019,13 +2079,16 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 				Agent:     r.agent,
 			})
 			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
-				blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP).CloseFramePayload())
+				blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "DLP violation")
 			return true
 		}
 
 		baseAction := config.ActionWarn
-		effectiveAction := decide.UpgradeAction(baseAction, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
+		effectiveAction := baseAction
+		if !numberOnly {
+			effectiveAction = decide.UpgradeAction(baseAction, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
+		}
 		if effectiveAction == config.ActionBlock {
 			reason := fmt.Sprintf("DLP match: %s (escalated)", strings.Join(names, ", "))
 			r.recordFinding(session.SignalBlock, log, scanner.ScannerDLP, reason)
@@ -2049,12 +2112,14 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 				Agent:     r.agent,
 			})
 			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
-				blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP).CloseFramePayload())
+				blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "DLP violation")
 			return true
 		}
 
-		r.recordFinding(session.SignalNearMiss, log, scanner.ScannerDLP, fmt.Sprintf("DLP match: %s", strings.Join(names, ", ")))
+		if !numberOnly {
+			r.recordFinding(session.SignalNearMiss, log, scanner.ScannerDLP, fmt.Sprintf("DLP match: %s", strings.Join(names, ", ")))
+		}
 		log.LogWSScan(audit.WSScanEvent{
 			Target:    r.targetURL,
 			Direction: audit.DirectionClientToServer,
@@ -2115,7 +2180,7 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 				Agent:     r.agent,
 			})
 			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
-				blockInfoFor(blockreason.DLPMatch, scannerLabelAddressProtection).CloseFramePayload())
+				blockInfoFor(blockreason.DLPMatch, scannerLabelAddressProtection).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "address poisoning detected")
 			return true
 		}
@@ -2139,7 +2204,7 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 				Agent:     r.agent,
 			})
 			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
-				blockInfoFor(blockreason.DLPMatch, scannerLabelAddressProtection).CloseFramePayload())
+				blockInfoFor(blockreason.DLPMatch, scannerLabelAddressProtection).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "address poisoning detected")
 			return true
 		}
@@ -2226,7 +2291,7 @@ func wsFilterUniqueDLPMatches(matches []scanner.TextDLPMatch, excluded map[strin
 }
 
 func wsDLPMatchKey(match scanner.TextDLPMatch) string {
-	return match.PatternName + "\x00" + match.Encoded
+	return match.PatternName + "\x00" + match.Encoded + "\x00" + strconv.FormatBool(match.IsInformational())
 }
 
 func wsAddAddressFindingKeys(seen map[string]struct{}, findings []addressprotect.Finding) {
@@ -2371,7 +2436,7 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 			RedactionProfile: r.cfg.Redaction.DefaultProfile,
 			RedactionReport:  result.RedactionReport,
 		})
-		closePayload := blockInfoFor(closeBlockReason, receiptLayer).CloseFramePayload()
+		closePayload := blockInfoFor(closeBlockReason, receiptLayer).WithRequestID(r.requestID).CloseFramePayload()
 		_ = closeReason // free-text closeReason kept for receipt logging above
 		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, closePayload)
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, closePayload)
@@ -2395,7 +2460,7 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 	}
 
 	originalAction := action
-	if !result.IsEntropyOnly() {
+	if !result.IsEntropyOnly() && !result.IsInformationalCardRuns() {
 		action = decide.UpgradeAction(action, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
 	}
 	if action != originalAction {
@@ -2424,7 +2489,7 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 			})
 			return false
 		}
-		if !result.IsEntropyOnly() {
+		if !result.IsEntropyOnly() && !result.IsInformationalCardRuns() {
 			r.recordFinding(session.SignalBlock, log, scannerLabel, reason)
 		}
 		blockReason := reason
@@ -2450,13 +2515,13 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 			RedactionProfile: r.cfg.Redaction.DefaultProfile,
 			RedactionReport:  result.RedactionReport,
 		})
-		closePayload := blockInfoFor(closeBlockReason, receiptLayer).CloseFramePayload()
+		closePayload := blockInfoFor(closeBlockReason, receiptLayer).WithRequestID(r.requestID).CloseFramePayload()
 		_ = closeReason // free-text closeReason kept for receipt logging above
 		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, closePayload)
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, closePayload)
 		return true
 	case config.ActionWarn:
-		if !result.IsEntropyOnly() {
+		if !result.IsEntropyOnly() && !result.IsInformationalCardRuns() {
 			r.recordFinding(session.SignalNearMiss, log, scannerLabel, reason)
 		}
 		if len(result.DLPMatches) > 0 {
@@ -2515,7 +2580,8 @@ func (r *wsRelay) blockIdentityReload() bool {
 	r.terminalOnce.Do(func() {
 		r.proxy.logger.LogWSBlocked(audit.WSBlockedEvent{Target: r.targetURL, Scanner: "identity_reload", Reason: stateIdentityReloadReason, ClientIP: r.clientIP, RequestID: r.requestID, Agent: r.agent, AgentAuth: string(r.actorAuth)})
 		_ = r.emitReceipt(receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: "identity_reload", Pattern: stateIdentityReloadReason, Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent})
-		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, stateIdentityReloadReason)
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+			blockInfoFor(blockreason.AuthorityMismatch, "identity_reload").WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, stateIdentityReloadReason)
 	})
 	return true
@@ -2534,8 +2600,15 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 	}()
 	defer r.recoverRelayPanic(cancel, &blocked)
 	frag := &plwsutil.FragmentState{MaxBytes: r.maxMsg}
-	var crossMsgTail []byte   // rolling tail for text-message DLP scanning
+	var crossMsgTail []byte // rolling tail for text-message DLP scanning
+	var crossMsgCardTail []byte
+	var crossMsgNumberTail []byte
+	var crossMsgNumberCardTail []byte
 	var controlMsgTail []byte // separate tail for Ping/Pong payload DLP scanning
+	// JSON-framed messages are reassembled per field by the upstream, so a
+	// value split across messages is joined per field here as well; the raw
+	// tail cannot see across the JSON envelope between the halves.
+	fieldTail := extract.NewFieldTailsWithLimit("", r.crossMessageFieldLimit())
 	log := r.proxy.logger.With("agent", r.agent).WithCorrelation(r.correlation)
 	redactionEnabled := r.redaction != nil && r.redaction.required
 
@@ -2573,7 +2646,8 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 					Agent:     r.agent,
 				})
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "kill switch active")
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+				blockInfoFor(blockreason.KillSwitchActive, "kill_switch").WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "kill switch active")
 			blocked = true
 			return
@@ -2608,7 +2682,8 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 					Agent:     r.agent,
 				})
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+				blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
 			blocked = true
 			return
@@ -2731,7 +2806,8 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 					RequestID: r.requestID,
 					Agent:     r.agent,
 				})
-				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "binary frames not allowed")
+				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+					blockInfo("ws_protocol").WithRequestID(r.requestID).CloseFramePayload())
 				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "binary frames not allowed")
 				blocked = true
 				return
@@ -2757,7 +2833,8 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 				RequestID: r.requestID,
 				Agent:     r.agent,
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, reason)
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+				blockInfo(scannerLabelRedaction).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, reason)
 			blocked = true
 			return
@@ -2782,7 +2859,8 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 				RequestID: r.requestID,
 				Agent:     r.agent,
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, closeCode, closeReason)
+			plwsutil.WriteCloseFrame(r.clientConn, closeCode,
+				blockInfo("ws_protocol").WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, closeCode, closeReason)
 			blocked = true
 			return
@@ -2836,17 +2914,38 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 
 		if isTextMessage && r.scanText {
 			prevTail := crossMsgTail
+			prevCardTail := crossMsgCardTail
+			numberText, numberCard := extract.JSONNumberStreamViews(msg)
+			if len(crossMsgNumberTail) > 0 && numberText != "" {
+				if r.scanClientNumberText(ctx, log, append(append([]byte(nil), crossMsgNumberTail...), numberText...), append(append([]byte(nil), crossMsgNumberCardTail...), []byte(jsonnumber.NumberBoundary+numberCard)...)) {
+					blocked = true
+					return
+				}
+			}
+			if numberText == "" {
+				crossMsgNumberTail, crossMsgNumberCardTail = nil, nil
+			} else {
+				crossMsgNumberTail = updateWSCrossMessageTail(crossMsgNumberTail, []byte(numberText))
+				crossMsgNumberCardTail = updateWSCrossMessageTail(crossMsgNumberCardTail, []byte(jsonnumber.NumberBoundary+numberCard))
+			}
+			// Only the complete original message establishes numeric provenance.
+			// Retained suffixes and incomplete text are never parsed as numbers.
+			cardMsg := []byte(jsonnumber.StructuredCardView(string(msg), extract.MaxExtractDepth))
 			var scanInput []byte
+			var cardInput []byte
 			if !redactionEnabled {
 				if len(prevTail) > 0 {
 					scanInput = append(prevTail, msg...)
+					cardInput = append(prevCardTail, cardMsg...)
 				} else {
 					scanInput = msg
+					cardInput = cardMsg
 				}
 			}
 			crossMsgTail = updateWSCrossMessageTail(prevTail, msg)
+			crossMsgCardTail = updateWSCrossMessageTail(prevCardTail, cardMsg)
 			if !redactionEnabled {
-				if len(scanInput) > 0 && r.scanClientText(ctx, log, scanInput) {
+				if len(scanInput) > 0 && r.scanClientTextWithCardView(ctx, log, scanInput, cardInput) {
 					blocked = true
 					return
 				}
@@ -2854,10 +2953,23 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 					blocked = true
 					return
 				}
-			} else if len(prevTail) > 0 && r.scanClientCrossMessageText(ctx, log, prevTail, msg) {
+			} else if len(prevTail) > 0 && r.scanClientCrossMessageTextViews(ctx, log, prevTail, msg, prevCardTail, cardMsg) {
 				blocked = true
 				return
 			}
+			frame := fieldTail.ParseFrame(msg)
+			for _, view := range fieldTail.Views(frame) {
+				if r.scanClientCrossMessageText(ctx, log, []byte(view.Tail), []byte(view.Value)) {
+					blocked = true
+					return
+				}
+			}
+			if fieldTail.Incomplete(frame) {
+				r.blockCrossMessageIncomplete(log, audit.DirectionClientToServer)
+				blocked = true
+				return
+			}
+			fieldTail.Advance(frame, false)
 		}
 
 		if ctx.Err() != nil {
@@ -2920,7 +3032,8 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
 			Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
 		})
-		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "response scan incomplete")
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+			blockInfoFor(blockreason.ParseError, "response_scan_error").WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "response scan incomplete")
 		return nil, true
 	}
@@ -2959,7 +3072,8 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
 			Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
 		})
-		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+			blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
 		return nil, true
 	case config.ActionStrip:
@@ -2979,7 +3093,8 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 				ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
 				Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+				blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
 			return nil, true
 		}
@@ -2998,7 +3113,8 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 			ActionID: receipt.NewActionID(), Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
 			Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent,
 		})
-		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "injection detected")
+		plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+			blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(r.requestID).CloseFramePayload())
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "injection detected")
 		return nil, true
 	default:
@@ -3016,7 +3132,7 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 		if err != nil {
 			r.proxy.recordRequiredReceiptBlock(err, TransportWS)
 			log.LogError(actx, fmt.Errorf("confirm WebSocket response receipt: %w", err))
-			payload := blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer).CloseFramePayload()
+			payload := blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer).WithRequestID(r.requestID).CloseFramePayload()
 			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, payload)
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, payload)
 			return nil, true
@@ -3041,7 +3157,7 @@ func (r *wsRelay) denySessionCapacity(direction string) {
 	})
 	r.proxy.metrics.RecordWSBlocked()
 	plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
-		blockInfoFor(blockreason.DataBudget, sessionCapacityLayer).CloseFramePayload())
+		blockInfoFor(blockreason.DataBudget, sessionCapacityLayer).WithRequestID(r.requestID).CloseFramePayload())
 }
 
 func (r *wsRelay) observeUpstreamResponseTaint(promptHit bool) bool {
@@ -3076,6 +3192,7 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 	defer r.recoverRelayPanic(cancel, &blocked)
 	frag := &plwsutil.FragmentState{MaxBytes: r.maxMsg}
 	log := r.proxy.logger.With("agent", r.agent).WithCorrelation(r.correlation)
+	crossMessage := newUpstreamCrossMessage(r.crossMessageFieldLimit())
 
 	for {
 		if r.clientClosing.Load() && !time.Now().Before(r.closeGraceDeadline()) {
@@ -3116,7 +3233,8 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 					Agent:     r.agent,
 				})
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "kill switch active")
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+				blockInfoFor(blockreason.KillSwitchActive, "kill_switch").WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "kill switch active")
 			blocked = true
 			return
@@ -3150,7 +3268,8 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 					Agent:     r.agent,
 				})
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
+			plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+				blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny).WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
 			blocked = true
 			return
@@ -3308,7 +3427,8 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 					RequestID: r.requestID,
 					Agent:     r.agent,
 				})
-				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "binary frames not allowed")
+				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+					blockInfo("ws_protocol").WithRequestID(r.requestID).CloseFramePayload())
 				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "binary frames not allowed")
 				blocked = true
 				return
@@ -3334,7 +3454,8 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 				RequestID: r.requestID,
 				Agent:     r.agent,
 			})
-			plwsutil.WriteCloseFrame(r.clientConn, closeCode, closeReason)
+			plwsutil.WriteCloseFrame(r.clientConn, closeCode,
+				blockInfo("ws_protocol").WithRequestID(r.requestID).CloseFramePayload())
 			plwsutil.WriteClientCloseFrame(r.upstreamConn, closeCode, closeReason)
 			blocked = true
 			return
@@ -3377,7 +3498,8 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 					RequestID: r.requestID,
 					Agent:     r.agent,
 				})
-				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "media blocked")
+				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation,
+					blockInfoFor(blockreason.MediaPolicy, "media_policy").WithRequestID(r.requestID).CloseFramePayload())
 				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "media blocked")
 				blocked = true
 				return
@@ -3386,7 +3508,7 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 				if r.cfg.FlightRecorder.RequireReceipts {
 					if err := r.proxy.confirmResponseDecision(r.cfg, mediaRewriteReceipt(withReceiptShard(receipt.EmitOpts{ParentActionID: r.requestActionID, Transport: TransportWS, Method: "WS", Target: r.targetURL, RequestID: r.requestID, Agent: r.agent}, r.receiptShard))); err != nil {
 						r.proxy.recordRequiredReceiptBlock(err, TransportWS)
-						payload := blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer).CloseFramePayload()
+						payload := blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer).WithRequestID(r.requestID).CloseFramePayload()
 						plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, payload)
 						plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, payload)
 						blocked = true
@@ -3411,6 +3533,10 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 			var responseBlocked bool
 			msg, responseBlocked = r.enforceUpstreamTextPayload(ctx, log, msg, true)
 			if responseBlocked {
+				blocked = true
+				return
+			}
+			if crossMessage.enforce(ctx, r, log, msg) {
 				blocked = true
 				return
 			}

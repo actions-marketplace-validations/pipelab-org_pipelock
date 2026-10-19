@@ -35,6 +35,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/emitformat"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/identitykey"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/license"
 	"github.com/luckyPipewrench/pipelock/internal/media"
 	"github.com/luckyPipewrench/pipelock/internal/secperm"
@@ -2075,8 +2076,11 @@ func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
 		if scheme == "" {
 			scheme = QueryEntropyParamDefaultScheme
 		}
-		if scheme != schemeHTTPS {
-			return fmt.Errorf("%s.scheme %q must be https", field, entry.Scheme)
+		// An omitted scheme stays https. An explicit http entry is a separate
+		// exemption for that cleartext route. Query-parameter exclusions stay
+		// https-only in validateQueryEntropyParamExclusions.
+		if scheme != schemeHTTPS && scheme != schemeHTTP {
+			return fmt.Errorf("%s.scheme %q must be http or https", field, entry.Scheme)
 		}
 
 		if err := RawHostASCIIError(entry.Host); err != nil {
@@ -2768,13 +2772,6 @@ func validateToolPolicyStructuralTypeCompatibility(r ToolPolicyRule) error {
 	return nil
 }
 
-const (
-	toolPolicyMaxNumberChars  = 4096
-	toolPolicyMaxNumberExpAbs = 10000
-)
-
-var toolPolicyJSONNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$`)
-
 // ParseBoundedJSONNumber parses a JSON number into an exact big.Rat, rejecting
 // values that are empty, over-long, malformed, or whose exponent magnitude
 // exceeds a safe bound. The exponent is bounded BEFORE any big-number
@@ -2785,49 +2782,7 @@ var toolPolicyJSONNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9]\d*)(?:\.\d+)
 // bound can apply. Shared by config validation and the MCP tool-policy engine
 // so the parse+bounds logic has a single source of truth.
 func ParseBoundedJSONNumber(n json.Number) (*big.Rat, bool) {
-	s := n.String()
-	if len(s) == 0 || len(s) > toolPolicyMaxNumberChars || !toolPolicyJSONNumberPattern.MatchString(s) {
-		return nil, false
-	}
-
-	base, expPart, hasExp := strings.Cut(strings.ToLower(s), "e")
-	exp := 0
-	if hasExp {
-		parsed, err := strconv.Atoi(expPart)
-		if err != nil || parsed > toolPolicyMaxNumberExpAbs || parsed < -toolPolicyMaxNumberExpAbs {
-			return nil, false
-		}
-		exp = parsed
-	}
-
-	negative := strings.HasPrefix(base, "-")
-	base = strings.TrimPrefix(base, "-")
-	intPart, fracPart, hasFrac := strings.Cut(base, ".")
-	digits := intPart
-	scale := 0
-	if hasFrac {
-		digits += fracPart
-		scale = len(fracPart)
-	}
-	digits = strings.TrimLeft(digits, "0")
-	if digits == "" {
-		digits = "0"
-	}
-
-	num := new(big.Int)
-	if _, ok := num.SetString(digits, 10); !ok {
-		return nil, false
-	}
-	if negative {
-		num.Neg(num)
-	}
-	den := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	if exp >= 0 {
-		num.Mul(num, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(exp)), nil))
-	} else {
-		den.Mul(den, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-exp)), nil))
-	}
-	return new(big.Rat).SetFrac(num, den), true
+	return jsonnumber.Parse(n)
 }
 
 func (c *Config) validateDefer(warnings *[]Warning) error {
@@ -3281,6 +3236,9 @@ func (c *Config) validateWebSocketProxy(warnings *[]Warning) error {
 	}
 	if c.WebSocketProxy.IdleTimeoutSeconds <= 0 {
 		return fmt.Errorf("websocket_proxy.idle_timeout_seconds must be positive")
+	}
+	if c.WebSocketProxy.CrossMessageFieldLimit < 0 || c.WebSocketProxy.CrossMessageFieldLimit > MaxWebSocketCrossMessageFieldLimit {
+		return fmt.Errorf("websocket_proxy.cross_message_field_limit must be between 0 and %d", MaxWebSocketCrossMessageFieldLimit)
 	}
 	switch c.WebSocketProxy.OriginPolicy {
 	case OriginPolicyRewrite, OriginPolicyForward, ActionStrip:

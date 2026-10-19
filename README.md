@@ -110,7 +110,7 @@ These examples target the published v3.7.0 release. For an existing deployment, 
 
 ```bash
 # Build the current release from source (Community edition, Go 1.26+)
-git clone --branch v3.7.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 
 # Discover local agent integrations and save a config
@@ -464,7 +464,7 @@ Three HTTP proxy modes (same port), plus a dedicated MCP proxy and A2A inspectio
 
 - **Fetch proxy** (`/fetch?url=...`): Fetches the URL, extracts text, scans for injection, returns clean content.
 - **Forward proxy** (`HTTPS_PROXY`): Standard HTTP CONNECT tunneling without application code changes. Proxy configuration is still required. Optional TLS interception enables payload scanning.
-- **WebSocket proxy** (`/ws?url=ws://...`): Bidirectional frame scanning with DLP + injection detection.
+- **WebSocket proxy** (`/ws?url=ws://...`): Scans client-to-server text frames for DLP and prompt injection, and server-to-client text frames for prompt injection.
 - **MCP proxy** (`pipelock mcp proxy`): Wraps stdio or HTTP MCP servers with bidirectional scanning.
 - **A2A inspection**: Inspects Google Agent-to-Agent protocol traffic as it crosses the forward and MCP paths.
 
@@ -707,7 +707,7 @@ Full docs directory: [docs/](docs/)
 | [TLS Interception](docs/guides/tls-interception.md) | CONNECT-tunnel MITM: CA setup, body/header/response scanning, passthrough domains |
 | [Canary Tokens](docs/guides/canary-tokens.md) | Synthetic secrets that trip an alert the moment an agent tries to exfiltrate one |
 | [Detection Integration](docs/guides/detection-integration.md) | Feed Pipelock decisions and evidence into external detection / SIEM pipelines |
-| [PR Review](docs/guides/pr-review.md) | Manual-trigger AI security review for pull requests (`/review` comment) |
+| [Agent Review](docs/guides/agent-review.md) | Maintainer-triggered pull request review (`/review` or `/review deep` comment), run from `pipelab-org/agent-review` |
 | [MCP Inspector Front](docs/guides/mcp-inspector-front.md) | Front MCP dev tools (Inspector, test servers) through Pipelock scanning |
 | [`pipelock demo`](docs/cli/demo.md) | Self-contained attack scenarios with signed, offline-verifiable receipts, no config or network needed |
 | [Badges](docs/badges.md) | Drop-in Markdown for the `scanned by pipelock` badge on downstream projects |

@@ -2803,7 +2803,7 @@ func TestLogKillSwitchDeny_JSONFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger.LogKillSwitchDeny("http", "https://api.example.com/v1/chat", "global", "all traffic halted", "10.0.0.5")
+	logger.LogKillSwitchDeny("http", "https://api.example.com/v1/chat", "global", "all traffic halted", "10.0.0.5", "req-42")
 	logger.Close()
 
 	data, _ := os.ReadFile(filepath.Clean(path))
@@ -2814,6 +2814,7 @@ func TestLogKillSwitchDeny_JSONFormat(t *testing.T) {
 
 	checks := map[string]any{
 		"event":        "kill_switch_deny",
+		"request_id":   "req-42",
 		"transport":    "http",
 		"endpoint":     "https://api.example.com/v1/chat",
 		"source":       "global",
@@ -2847,7 +2848,7 @@ func TestLogKillSwitchDeny_SanitizesFields(t *testing.T) {
 		"global",
 		"bad\x1b[0mmessage",
 		"10.0.0\x1b[2J.1",
-	)
+		"")
 	logger.Close()
 
 	data, _ := os.ReadFile(filepath.Clean(path))
@@ -3815,7 +3816,7 @@ func TestEmit_RemediationHintSweep(t *testing.T) {
 		{
 			name: "kill switch deny",
 			log: func(logger *Logger) {
-				logger.LogKillSwitchDeny("fetch", "/fetch", "sentinel", "maintenance", testClientIP)
+				logger.LogKillSwitchDeny("fetch", "/fetch", "sentinel", "maintenance", testClientIP, "")
 			},
 			wantEvent: EventKillSwitchDeny,
 			wantHint:  "active kill-switch source",
@@ -4242,7 +4243,7 @@ func TestEmit_LogKillSwitchDeny(t *testing.T) {
 	logger, sink := newLoggerWithEmitter(t)
 	defer logger.Close()
 
-	logger.LogKillSwitchDeny("http", "https://example.com", "global", "halted", testClientIP)
+	logger.LogKillSwitchDeny("http", "https://example.com", "global", "halted", testClientIP, "")
 
 	ev, ok := sink.lastEvent()
 	if !ok {
@@ -4261,7 +4262,7 @@ func TestEmit_DefensiveEvents_NoMITRETechnique(t *testing.T) {
 	defer logger.Close()
 
 	// Kill switch deny is a defensive action, not an attack detection.
-	logger.LogKillSwitchDeny("http", "https://example.com", "api", "testing", testClientIP)
+	logger.LogKillSwitchDeny("http", "https://example.com", "api", "testing", testClientIP, "")
 	ev, ok := sink.lastEvent()
 	if !ok {
 		t.Fatal("expected emitted event for kill_switch_deny")
@@ -6157,5 +6158,106 @@ func TestLogAgentIdentityCollision_JSONFormat(t *testing.T) {
 	score, ok := entry["score"].(float64)
 	if !ok || score < 0.69 || score > 0.71 {
 		t.Errorf("expected score ~0.7, got %v", entry["score"])
+	}
+}
+
+func TestJSONInspectionRemediationHints(t *testing.T) {
+	pattern := scannerpkg.UninspectableJSONNumberPattern
+	ctx := LogContext{method: "POST", target: "https://api.vendor.example/submit"}
+	for name, log := range map[string]func(*Logger){
+		"body": func(l *Logger) { l.LogBodyDLP(ctx, "block", 1, []string{pattern}, nil) },
+		"blocked": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.ScannerBodyDLP, "request body contains secret: "+pattern)
+		},
+		"response": func(l *Logger) { l.LogResponseScan(ctx, "block", 1, []string{pattern}, nil) },
+		"header":   func(l *Logger) { l.LogHeaderDLP(ctx, "X-Value", "block", []string{pattern}, nil) },
+		"a2a":      func(l *Logger) { l.LogBodyScan(ctx, EventType(scannerpkg.AuditA2AScan), "block", 1, []string{pattern}) },
+		"websocket-blocked": func(l *Logger) {
+			l.LogWSBlocked(WSBlockedEvent{Scanner: scannerpkg.ScannerDLP, Reason: "DLP match: " + pattern})
+		},
+		"http-fragment": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.AuditCrossRequestFragment, "fragment reassembly DLP match: "+pattern)
+		},
+		"mcp-fragment": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.AuditCrossRequestFragment, "cross-request fragment refused: "+pattern+"; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)")
+		},
+		"websocket": func(l *Logger) {
+			l.LogWSScan(WSScanEvent{Direction: DirectionClientToServer, Action: "block", PatternNames: []string{pattern}, MatchCount: 1})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log(logger)
+			logger.Close()
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatal(err)
+			}
+			hint, _ := entry["remediation_hint"].(string)
+			if !strings.Contains(hint, "Reduce nesting or number size") || strings.Contains(strings.ToLower(hint), "suppress") {
+				t.Fatalf("inspection hint = %q", hint)
+			}
+		})
+	}
+}
+
+func TestRemediationNestedJSONInspectionKey(t *testing.T) {
+	for _, label := range []string{scannerpkg.ScannerSSRF, scannerpkg.ScannerDLP} {
+		t.Run(label, func(t *testing.T) {
+			reason := "SSRF blocked: 10.0.0.12 is an internal IP"
+			if label == scannerpkg.ScannerDLP {
+				reason = "DLP match: Test credential (high)"
+			}
+			path := filepath.Join(t.TempDir(), "audit.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.LogBlocked(LogContext{method: "GET", target: "https://api.vendor.example/"}, label, fmt.Sprintf("nested URL in query parameter %q: %s", scannerpkg.UninspectableJSONNumberPattern, reason))
+			logger.Close()
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatal(err)
+			}
+			hint, _ := entry["remediation_hint"].(string)
+			baseline := scannerpkg.OperatorHintForResult(label, reason)
+			if baseline == "" || !strings.HasPrefix(hint, baseline) || strings.Contains(hint, "limits are fixed") {
+				t.Fatalf("hint = %q, want %q", hint, baseline)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationPatternIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pattern := "ordinary, " + scannerpkg.UninspectableJSONNumberPattern
+	logger.LogBodyDLP(LogContext{method: "POST", target: "https://api.vendor.example/"}, "block", 1, []string{pattern}, nil)
+	logger.Close()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["remediation_hint"] != scannerpkg.OperatorHintFor(scannerpkg.ScannerBodyDLP) {
+		t.Fatalf("display text changed hint: %v", entry["remediation_hint"])
 	}
 }

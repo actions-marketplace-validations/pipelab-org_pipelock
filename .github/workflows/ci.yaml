@@ -15,14 +15,6 @@ permissions:
   contents: read
 
 jobs:
-  # Exercise the same source validator with GitHub's actual runtime identity.
-  # This local helper may come from a PR, so give it no permissions or secrets.
-  pr-review-source:
-    needs: security-scan
-    if: github.repository == 'pipelab-org/pipelock'
-    permissions: {}
-    uses: ./.github/workflows/pr-review-source.yaml
-
   # Pipelock scans the PR diff before anything else runs. If the scan
   # finds credential leaks, injection patterns, or security misconfigs,
   # all downstream jobs are skipped — no compromised code executes.
@@ -107,7 +99,6 @@ jobs:
             --exclude test/secureiqlab/ \
             --exclude README.md \
             --exclude assets/demo.cast \
-            --exclude .github/actions/pr-review/pr_review.py \
             --exclude docs/attacks-blocked.md \
             --exclude docs/bypass-resistance.md \
             --exclude docs/configuration.md \
@@ -1289,43 +1280,6 @@ jobs:
           GOOS=aix GOARCH=ppc64 go test -c -o /tmp/recorder-aix.test ./internal/recorder
           GOOS=aix GOARCH=ppc64 go test -c -o /tmp/license-aix.test ./internal/license
 
-  # The reviewer's own regression suite now runs on pull requests.
-  #
-  # The repositories that kept their own copy of the reviewer ran these as a
-  # step inside the review itself. That never gated anything: a review is
-  # triggered by a comment, so it only ever executes the copy already on the
-  # default branch, and by then the change is merged. Consolidating onto one
-  # shared workflow then dropped even that step. So the suite has been proving
-  # nothing in either arrangement, while every guard in it reported green.
-  #
-  # This job is what makes them load-bearing, because it runs on the pull
-  # request that changes them. It covers the reviewer, the review workflow's
-  # permissions and authorization gate, and the adoption stub that other
-  # repositories copy.
-  pr-review-tests:
-    needs: [security-scan, changed-files]
-    # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - name: Install pinned dependencies
-        run: |
-          pip install --require-hashes -r .github/actions/pr-review/requirements.txt
-          pip install --require-hashes -r .github/requirements-pr-review-test.txt
-
-      - name: Run reviewer tests
-        run: python -m unittest scripts.pr_review_test
-
   lint:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
@@ -1403,7 +1357,7 @@ jobs:
       # ship, because an undeclared dependency that works today breaks silently
       # when the image changes.
       - name: Install pinned release-tooling test dependencies
-        run: pip install --require-hashes -r .github/requirements-pr-review-test.txt
+        run: pip install --require-hashes -r .github/requirements-scripts-test.txt
 
       # Release-tooling tests had no PR-time runner, so breaks stayed invisible
       # until tag time. The pattern covers both test_*.py and *_test.py modules.
@@ -1664,13 +1618,133 @@ jobs:
           GOOS=windows GOARCH=amd64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-amd64.exe ./cmd/pipelock
           GOOS=windows GOARCH=arm64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-arm64.exe ./cmd/pipelock
 
+  # The /review caller calls a reusable workflow in pipelab-org/agent-review,
+  # so without this job nothing here notices the caller drifting: inherited or
+  # extra secrets, a branch instead of a commit, another repository, or wider
+  # permissions. It runs the pinned engine revision's own caller contract against
+  # the caller and profile, read as data. The accepted caller text lives only in
+  # that contract and the pin lives only in the caller, so neither is copied here.
+  # It holds no secrets and only a read token, and it never skips.
+  agent-review-contract:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: caller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/agent-review.yaml
+            .github/agent-review.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Read the pinned engine revision
+        id: pin
+        run: |
+          set -euo pipefail
+          caller=caller/.github/workflows/agent-review.yaml
+          # grep exits 1 for no match; anything else means the caller is unreadable.
+          status=0
+          uses="$(grep -E '^[[:space:]-]*uses:' "$caller")" || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "agent review caller could not be read" >&2
+            exit 1
+          fi
+          # Exactly one call, to the engine repository, at a full commit SHA.
+          pattern='^    uses: pipelab-org/agent-review/\.github/workflows/agent-review-reusable\.yaml@[0-9a-f]{40} # main$'
+          if [ "$status" -ne 0 ] || [ "$(wc -l <<<"$uses")" -ne 1 ] || ! grep -Eq "$pattern" <<<"$uses"; then
+            echo "agent review caller must call pipelab-org/agent-review at a full commit SHA" >&2
+            exit 1
+          fi
+          pin="${uses##*@}"
+          pin="${pin%% *}"
+          echo "sha=$pin" >> "$GITHUB_OUTPUT"
+
+      # GitHub also resolves a SHA that exists only in a fork of the engine, so
+      # the pin must be on the engine's main branch before its validator runs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: pipelab-org/agent-review
+          ref: main
+          fetch-depth: 0
+          path: engine
+          persist-credentials: false
+
+      # A pull request may only move the pin forward. Any commit on engine main
+      # would pass the check above, including an older engine whose validator is
+      # weaker, so a pin the base branch already carries must be an ancestor of
+      # the new one. A base without a pin (first adoption) has nothing to compare.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/agent-review.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Read the base branch engine revision
+        id: base_pin
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          caller=base/.github/workflows/agent-review.yaml
+          pattern='^    uses: pipelab-org/agent-review/\.github/workflows/agent-review-reusable\.yaml@[0-9a-f]{40} # main$'
+          if [ -f "$caller" ]; then
+            status=0
+            line="$(grep -E "$pattern" "$caller")" || status=$?
+            if [ "$status" -gt 1 ]; then
+              echo "base agent review caller could not be read" >&2
+              exit 1
+            fi
+            if [ "$status" -eq 1 ]; then
+              exit 0
+            fi
+            pin="${line##*@}"
+            pin="${pin%% *}"
+            echo "sha=$pin" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require the pin on the engine main branch
+        env:
+          PIN: ${{ steps.pin.outputs.sha }}
+          BASE_PIN: ${{ steps.base_pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! git -C engine merge-base --is-ancestor "$PIN" HEAD; then
+            echo "agent review pin is not a commit on pipelab-org/agent-review main" >&2
+            exit 1
+          fi
+          if [ -n "${BASE_PIN:-}" ] && ! git -C engine merge-base --is-ancestor "$BASE_PIN" "$PIN"; then
+            echo "agent review pin $PIN is older than the base branch pin $BASE_PIN" >&2
+            exit 1
+          fi
+          git -C engine checkout --quiet --detach "$PIN"
+          if [ "$(git -C engine rev-parse HEAD)" != "$PIN" ]; then
+            echo "engine checkout does not match the agent review pin" >&2
+            exit 1
+          fi
+
+      - name: Validate the caller with the pinned engine contract
+        env:
+          PIN: ${{ steps.pin.outputs.sha }}
+          CALLER_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/agent-review.yaml@refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 -I engine/scripts/agent_review_contract.py --root caller --source-sha "$PIN"
+
   # Helm remains a separate diagnostic job, but the required `build` context
   # intentionally carries its result through `needs`. Keep that dependency
   # until a separately approved ruleset change makes `helm` required itself.
   # The parallel binary and cross-target producers also flow through this gate,
   # so a compilation failure cannot present as a successful required build check.
+  # The agent review caller contract flows through it too and never skips.
   build:
-    needs: [security-scan, changed-files, test-go126, test-go127, lint, lint-enterprise, lint-policy, config-examples, test-cross-target, helm, build-binaries, pr-review-tests, pr-review-source]
+    needs: [security-scan, changed-files, test-go126, test-go127, lint, lint-enterprise, lint-policy, config-examples, test-cross-target, helm, build-binaries, agent-review-contract]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1687,9 +1761,7 @@ jobs:
           CROSS_TARGET_RESULT: ${{ needs.test-cross-target.result }}
           HELM_RESULT: ${{ needs.helm.result }}
           BUILD_BINARIES_RESULT: ${{ needs.build-binaries.result }}
-          REVIEW_TESTS_RESULT: ${{ needs.pr-review-tests.result }}
-          REVIEW_SOURCE_RESULT: ${{ needs.pr-review-source.result }}
-          REPOSITORY: ${{ github.repository }}
+          AGENT_REVIEW_CONTRACT_RESULT: ${{ needs.agent-review-contract.result }}
           CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
           DOCS_ONLY: ${{ needs.changed-files.outputs.docs_only }}
           EVENT_NAME: ${{ github.event_name }}
@@ -1703,14 +1775,6 @@ jobs:
             echo "changed-files did not succeed, so skipped upper-lane tests are not evidence" >&2
             exit 1
           fi
-          # Only the canonical repository can prove its own reusable source
-          # identity. Fork CI intentionally skips that credential-free probe.
-          if [ "$REVIEW_SOURCE_RESULT" != success ]; then
-            if [ "$REPOSITORY" = pipelab-org/pipelock ] || [ "$REVIEW_SOURCE_RESULT" != skipped ]; then
-              echo "review source identity was not verified" >&2
-              exit 1
-            fi
-          fi
           # A documentation-only pull request skips these producers on purpose.
           # The skip is evidence only with a successful classifier that said so.
           docs_skip_ok=false
@@ -1722,7 +1786,8 @@ jobs:
             "$TEST_GO126_RESULT" \
             "$TEST_GO127_RESULT" \
             "$LINT_POLICY_RESULT" \
-            "$CONFIG_EXAMPLES_RESULT"; do
+            "$CONFIG_EXAMPLES_RESULT" \
+            "$AGENT_REVIEW_CONTRACT_RESULT"; do
             if [ "$result" != success ]; then
               echo "required build evidence is incomplete or failed" >&2
               exit 1
@@ -1733,7 +1798,6 @@ jobs:
             "$LINT_ENTERPRISE_RESULT" \
             "$CROSS_TARGET_RESULT" \
             "$HELM_RESULT" \
-            "$REVIEW_TESTS_RESULT" \
             "$BUILD_BINARIES_RESULT"; do
             if [ "$result" = skipped ] && [ "$docs_skip_ok" = true ]; then
               continue

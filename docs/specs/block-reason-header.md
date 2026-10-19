@@ -8,6 +8,10 @@ This document is the canonical schema. Once an agent in production reads `dlp_ma
 
 ## Header set
 
+Blocked proxy HTTP responses include `X-Pipelock-Request-ID` with the ID recorded for the block and `X-Pipelock-Operator` with exactly `pipelock explain event <id>`. This includes WebSocket handshake refusals and both the absolute-URI 403 and JSON 503 kill-switch responses. These headers do not depend on the opt-in `explain_blocks` setting, which still controls additional prose hints. Verdicts, status codes, and schema version 1 are unchanged.
+
+The ID must match the shared `receiptcontent.ValidRequestID` shape: `req-` followed by a lowercase canonical UUIDv7 or a decimal fallback counter. Both headers are omitted when the recorded ID is empty or malformed. Pipelock supplies its recorded ID; it never copies a client header or request URL into these fields. Shape validation is not proof of origin or a signed receipt.
+
 | Header | Required | Example | Meaning |
 |---|---|---|---|
 | `X-Pipelock-Block-Reason` | yes (on every block) | `dlp_match` | Machine-readable reason code. See vocabulary below. |
@@ -199,12 +203,13 @@ WebSocket blocks happen via close frames, not response headers. The close-frame 
 }
 ```
 
-Per RFC 6455 the close-frame reason payload is limited to 123 bytes. Agents should plan for truncation: if the JSON would exceed the limit, fields drop in this order — `receipt`, `layer`, `retry`, `severity`, `version` — leaving `block_reason` as the always-present floor.
+Per RFC 6455 the close-frame reason payload is limited to 123 bytes. A block payload also carries `request_id` when its recorded ID matches the shared shape and fits alongside `block_reason`. If the JSON exceeds the limit, fields drop in this order: `receipt`, `layer`, `retry`, `severity`, `version`, `request_id`. The reason is never dropped to make room for the ID. After upgrade there are no HTTP headers; the operator can run `pipelock explain event <request_id>` using the surviving ID.
 
 MCP stdio is not covered. There is no HTTP layer to attach headers to; MCP-stdio errors flow through the JSON-RPC error envelope. Block-reason taxonomy in JSON-RPC errors is tracked separately.
 
 ## Compatibility
 
+- Client-facing WebSocket closes for recorded blocks use the v1 JSON payload documented above. Clients must read `block_reason` instead of matching strings such as `kill switch active` or `injection detected`. Clients must also accept plain-text close reasons: oversized individual frames, compressed frames and invalid UTF-8 still use that format. Close status codes are unchanged: policy violations use 1008, fragment protocol errors use 1002, and oversized reassembled messages use 1009. Upstream-facing close reasons remain plain text; the audit event and receipt retain the specific diagnostic text, joined to the client payload by `request_id`.
 - Agents that ignore the header continue to work. The 403 status code and existing JSON body are unchanged.
 - Agents that read the header but don't recognize a code or severity should fall back to "generic block" handling.
 - Adding a new reason code is an additive change. Removing or renaming a code is a breaking change requiring a version bump.

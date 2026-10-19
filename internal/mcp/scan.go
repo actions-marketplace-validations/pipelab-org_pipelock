@@ -20,8 +20,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/provenance"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
@@ -183,6 +186,8 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 		return incompleteMediaVerdict(rpc.ID, textResult.IncompleteReason)
 	}
 	text := textResult.Text
+	cardText := textResult.CardText
+	cardKeys := textResult.CardKeys
 	// Numeric leaves travel on their own channel and are only ever compared
 	// against known values (canaries, configured secrets); they never join
 	// text, which feeds the injection cascade and pattern DLP.
@@ -195,10 +200,8 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
 		var rpcErr jsonrpc.RPCError
 		if err := json.Unmarshal(rpc.Error, &rpcErr); err == nil && rpcErr.Message != "" {
-			if text != "" {
-				text += "\n"
-			}
-			text += rpcErr.Message
+			text = joinResponseText(text, rpcErr.Message)
+			cardText = joinResponseText(cardText, rpcErr.Message)
 			// Also scan error.data if present.
 			errData := extract(rpcErr.Data)
 			if errData.Truncated {
@@ -207,8 +210,10 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 			if errData.IncompleteReason != "" {
 				return incompleteMediaVerdict(rpc.ID, errData.IncompleteReason)
 			}
+			cardKeys = append(cardKeys, errData.CardKeys...)
 			if errData.Text != "" {
-				text += "\n" + errData.Text
+				text = joinResponseText(text, errData.Text)
+				cardText = joinResponseText(cardText, errData.CardText)
 			}
 			numeric = joinNumericChannel(numeric, errData.Numeric)
 		} else {
@@ -220,11 +225,10 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 			if errText.IncompleteReason != "" {
 				return incompleteMediaVerdict(rpc.ID, errText.IncompleteReason)
 			}
+			cardKeys = append(cardKeys, errText.CardKeys...)
 			if errText.Text != "" {
-				if text != "" {
-					text += "\n"
-				}
-				text += errText.Text
+				text = joinResponseText(text, errText.Text)
+				cardText = joinResponseText(cardText, errText.CardText)
 			}
 			numeric = joinNumericChannel(numeric, errText.Numeric)
 		}
@@ -240,11 +244,10 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 		if paramsText.IncompleteReason != "" {
 			return incompleteMediaVerdict(rpc.ID, paramsText.IncompleteReason)
 		}
+		cardKeys = append(cardKeys, paramsText.CardKeys...)
 		if paramsText.Text != "" {
-			if text != "" {
-				text += "\n"
-			}
-			text += paramsText.Text
+			text = joinResponseText(text, paramsText.Text)
+			cardText = joinResponseText(cardText, paramsText.CardText)
 		}
 		numeric = joinNumericChannel(numeric, paramsText.Numeric)
 	}
@@ -252,7 +255,9 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 	// Every action inspects envelope strings not already owned by the typed
 	// extractor. Resource URIs retain injection coverage without becoming
 	// inbound response-DLP text.
-	envelopeText, resourceURIs, inspectable := responseEnvelopeRemainder(trimmed, rpc, &budget)
+	envelope, inspectable := responseEnvelopeRemainder(trimmed, rpc, &budget)
+	envelopeText, resourceURIs := envelope.text, envelope.uris
+	cardKeys = append(cardKeys, envelope.keys...)
 	if reason := budget.Reason(); reason != "" {
 		return incompleteMediaVerdict(rpc.ID, reason)
 	}
@@ -272,11 +277,19 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 	// coverage on their own view and stay out of inbound DLP.
 	joined := joinResponseText(text, envelopeText)
 	views := []string{joined, resourceURIs}
-	var dlpViews []string
+	var dlpViews []responseDLPView
 	if includeDLP {
-		dlpViews = []string{joined}
+		dlpViews = []responseDLPView{
+			{joined, joinResponseText(cardText, envelope.card)},
+			{text, cardText},
+			{envelopeText, envelope.card},
+		}
+		// Whole keys remain ordinary text, but never join one another or values.
+		for _, key := range cardKeys {
+			dlpViews = append(dlpViews, responseDLPView{key, key})
+		}
 	}
-	result, dlpMatches, droppedDLP := scanResponseViews(context.Background(), sc, opts, views, dlpViews)
+	result, dlpMatches, droppedDLP := scanResponseViewsWithCards(context.Background(), sc, opts, views, dlpViews)
 	if result.Failed() {
 		return jsonrpc.ScanVerdict{ID: rpc.ID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
 	}
@@ -297,6 +310,7 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 	}
 	if includeDLP {
 		dlpMatches = append(dlpMatches, sc.ScanNumericChannelForKnownValues(numeric)...)
+		dlpMatches = appendUniqueA2ADLPFindings(dlpMatches, responseJSONCardMatches(sc, trimmed, false))
 	}
 	if result.Clean && len(dlpMatches) == 0 {
 		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
@@ -305,10 +319,47 @@ func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOp
 	return jsonrpc.ScanVerdict{
 		ID:         rpc.ID,
 		Clean:      false,
-		Action:     responseScanAction(sc, opts),
+		Action:     responseFindingAction(sc, opts, result.Matches, dlpMatches),
 		Matches:    result.Matches,
 		DLPMatches: dlpMatches,
 	}
+}
+
+// responseJSONCardMatches retains the original number spellings in every
+// response payload field, including extensions and tools/list siblings. Routing
+// metadata is not payload. Complete JSON documents in string leaves receive
+// their own pass before extracted text joins can erase their shape.
+func responseJSONCardMatches(sc *scanner.Scanner, line []byte, toolsList bool) []scanner.TextDLPMatch {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(line, &fields) != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		if key != "jsonrpc" && key != "id" && key != "method" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	var matches []scanner.TextDLPMatch
+	for _, key := range keys {
+		raw := fields[key]
+		maxDepth := extract.MaxExtractDepth
+		if toolsList && key == "result" {
+			// tools/list extraction and its tool gate count from result.tools.
+			// This raw result view adds exactly one surrounding object; see
+			// TestForwardScanned_SchemaDepthGateMatchesEnvelopeExtraction.
+			maxDepth++
+		}
+		matches = appendUniqueA2ADLPFindings(matches, sc.ScanJSONCardRunsWithDepth(context.Background(), string(raw), maxDepth))
+		for _, leaf := range jsonrpc.ExtractStringsFromJSONResult(raw).Strings {
+			trimmed := strings.TrimSpace(leaf)
+			if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+				matches = appendUniqueA2ADLPFindings(matches, sc.ScanJSONCardRuns(context.Background(), leaf))
+			}
+		}
+	}
+	return matches
 }
 
 // appendUniqueResponseViewMatches keeps the primary view's coordinates when
@@ -360,10 +411,12 @@ func uniqueResponseMatches(matches []scanner.ResponseMatch) []scanner.ResponseMa
 	return unique
 }
 
-// scanResponseViews scans each non-empty view on its own and merges the
-// findings, so a string seen by two views is reported once. A failed
+type responseDLPView struct{ text, card string }
+
+// scanResponseViewsWithCards scans each non-empty view on its own and merges
+// the findings, so a string seen by two views is reported once. A failed
 // injection scan returns the failed result; the caller must fail closed.
-func scanResponseViews(ctx context.Context, sc *scanner.Scanner, opts ResponseScanOptions, injectionViews, dlpViews []string) (scanner.ResponseScanResult, []scanner.TextDLPMatch, []scanner.TextDLPMatch) {
+func scanResponseViewsWithCards(ctx context.Context, sc *scanner.Scanner, opts ResponseScanOptions, injectionViews []string, dlpViews []responseDLPView) (scanner.ResponseScanResult, []scanner.TextDLPMatch, []scanner.TextDLPMatch) {
 	result := scanner.ResponseScanResult{Clean: true}
 	for _, view := range injectionViews {
 		if view == "" {
@@ -386,45 +439,65 @@ func scanResponseViews(ctx context.Context, sc *scanner.Scanner, opts ResponseSc
 	}
 	var dlpMatches, droppedDLP []scanner.TextDLPMatch
 	for _, view := range dlpViews {
-		if view == "" {
+		if view.text == "" {
 			continue
 		}
 		// Deliberately not ctx: TextDLPResult has no incomplete or error state,
 		// so a scan cut short by cancellation would read as clean. The work is
 		// bounded by the response size limit; finishing it is the safe choice.
-		matches, lowConfidence := scanner.PartitionInboundTextDLPMatches(view, sc.ScanTextForDLPInbound(context.Background(), view).Matches)
+		// Response card views omit object keys. Reconstruct only that view;
+		// the ordinary text join can contain JSON-shaped key fragments.
+		// These are untrusted text views, not extractor boundary markers.
+		cardView := jsonnumber.EscapeCardBoundaries(view.card)
+		matches, lowConfidence := scanner.PartitionInboundTextDLPMatches(view.text, sc.ScanTextForDLPInboundWithTypedCardView(context.Background(), view.text, cardView).Matches)
 		dlpMatches = appendUniqueA2ADLPFindings(dlpMatches, matches)
 		droppedDLP = appendUniqueA2ADLPFindings(droppedDLP, lowConfidence)
 	}
 	return result, dlpMatches, droppedDLP
 }
 
-// toolsListEnvelopeText returns the visible strings and keys of a tools/list
+// toolsListEnvelopeViews returns the visible strings and keys of a tools/list
 // message outside result.tools, which the tool scanner owns.
-func toolsListEnvelopeText(trimmed []byte, budget *jsonrpc.MediaTextBudget) (string, bool) {
+func toolsListEnvelopeViews(trimmed []byte, budget *jsonrpc.MediaTextBudget) (responseEnvelopeViews, bool) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(trimmed, &envelope); err != nil {
-		return "", false
+		return responseEnvelopeViews{}, false
 	}
 	var result map[string]json.RawMessage
 	if raw, ok := envelope["result"]; ok && json.Unmarshal(raw, &result) == nil {
 		delete(result, "tools")
 		encoded, err := json.Marshal(result)
 		if err != nil {
-			return "", false
+			return responseEnvelopeViews{}, false
 		}
 		envelope["result"] = encoded
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
-		return "", false
+		return responseEnvelopeViews{}, false
 	}
 	values := jsonrpc.ExtractVisibleStringsFromJSONResultWithMediaBudget(encoded, budget)
 	keys := jsonrpc.ExtractKeysFromJSONResult(encoded)
 	if values.Truncated || keys.Truncated {
-		return "", false
+		return responseEnvelopeViews{}, false
 	}
-	return strings.Join(append(values.Strings, keys.Keys...), "\n"), true
+	return responseEnvelopeViews{
+		text: joinResponseText(append(values.Strings, keys.Keys...)...),
+		card: jsonrpc.ResponseCardText(values.CardAtoms),
+		keys: keys.Keys,
+	}, true
+}
+
+// responseFindingAction refuses incomplete inspection and keeps informational
+// card evidence out of content-action escalation.
+func responseFindingAction(sc *scanner.Scanner, opts ResponseScanOptions, injection []scanner.ResponseMatch, dlp []scanner.TextDLPMatch) string {
+	if scanner.HasInspectionLimit(dlp) {
+		return config.ActionBlock
+	}
+	if len(injection) == 0 && scanner.OnlyInformational(dlp) {
+		return config.ActionWarn
+	}
+	return responseScanAction(sc, opts)
 }
 
 // responseScanAction resolves the effective response-scan action. A per-server
@@ -636,7 +709,8 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 		}
 	}
 
-	var text, toolText, numeric string
+	var text, toolText, cardText, toolCardText, numeric string
+	var cardKeys []string
 
 	// One media budget covers every extraction over this response; see
 	// scanResponseOpts.
@@ -666,6 +740,8 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 						return incompleteMediaVerdict(rpc.ID, extracted.IncompleteReason)
 					}
 					toolText = extracted.Text
+					toolCardText = extracted.CardText
+					cardKeys = append(cardKeys, extracted.CardKeys...)
 					numeric = joinNumericChannel(numeric, extracted.Numeric)
 					continue
 				}
@@ -676,11 +752,10 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 				if siblingText.IncompleteReason != "" {
 					return incompleteMediaVerdict(rpc.ID, siblingText.IncompleteReason)
 				}
+				cardKeys = append(cardKeys, siblingText.CardKeys...)
 				if siblingText.Text != "" {
-					if text != "" {
-						text += "\n"
-					}
-					text += siblingText.Text
+					text = joinResponseText(text, siblingText.Text)
+					cardText = joinResponseText(cardText, siblingText.CardText)
 				}
 				numeric = joinNumericChannel(numeric, siblingText.Numeric)
 			}
@@ -691,10 +766,8 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
 		var rpcErr jsonrpc.RPCError
 		if err := json.Unmarshal(rpc.Error, &rpcErr); err == nil && rpcErr.Message != "" {
-			if text != "" {
-				text += "\n"
-			}
-			text += rpcErr.Message
+			text = joinResponseText(text, rpcErr.Message)
+			cardText = joinResponseText(cardText, rpcErr.Message)
 			errData := extract(rpcErr.Data)
 			if errData.Truncated {
 				return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: false, Error: uninspectableJSONDepthReason}
@@ -702,8 +775,10 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 			if errData.IncompleteReason != "" {
 				return incompleteMediaVerdict(rpc.ID, errData.IncompleteReason)
 			}
+			cardKeys = append(cardKeys, errData.CardKeys...)
 			if errData.Text != "" {
-				text += "\n" + errData.Text
+				text = joinResponseText(text, errData.Text)
+				cardText = joinResponseText(cardText, errData.CardText)
 			}
 			numeric = joinNumericChannel(numeric, errData.Numeric)
 		} else {
@@ -714,11 +789,10 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 			if errText.IncompleteReason != "" {
 				return incompleteMediaVerdict(rpc.ID, errText.IncompleteReason)
 			}
+			cardKeys = append(cardKeys, errText.CardKeys...)
 			if errText.Text != "" {
-				if text != "" {
-					text += "\n"
-				}
-				text += errText.Text
+				text = joinResponseText(text, errText.Text)
+				cardText = joinResponseText(cardText, errText.CardText)
 			}
 			numeric = joinNumericChannel(numeric, errText.Numeric)
 		}
@@ -733,11 +807,10 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 		if paramsText.IncompleteReason != "" {
 			return incompleteMediaVerdict(rpc.ID, paramsText.IncompleteReason)
 		}
+		cardKeys = append(cardKeys, paramsText.CardKeys...)
 		if paramsText.Text != "" {
-			if text != "" {
-				text += "\n"
-			}
-			text += paramsText.Text
+			text = joinResponseText(text, paramsText.Text)
+			cardText = joinResponseText(cardText, paramsText.CardText)
 		}
 		numeric = joinNumericChannel(numeric, paramsText.Numeric)
 	}
@@ -752,7 +825,9 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 
 	// Envelope members outside result, and keys of result's siblings, get the
 	// same inspection as on every other response path.
-	envelopeText, ok := toolsListEnvelopeText(trimmed, &budget)
+	envelope, ok := toolsListEnvelopeViews(trimmed, &budget)
+	envelopeText := envelope.text
+	cardKeys = append(cardKeys, envelope.keys...)
 	if reason := budget.Reason(); reason != "" {
 		return incompleteMediaVerdict(rpc.ID, reason)
 	}
@@ -767,7 +842,11 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 	// As on every other response path, sibling, error, params and envelope
 	// strings form one view so a finding split across them still matches.
 	// Tool text joins only the DLP view; the tool scanner owns its injection.
-	result, dlpMatches, droppedDLP := scanResponseViews(ctx, sc, opts, []string{joinResponseText(text, envelopeText)}, []string{joinResponseText(dlpText, envelopeText)})
+	dlpViews := []responseDLPView{{joinResponseText(dlpText, envelopeText), joinResponseText(cardText, toolCardText, envelope.card)}}
+	for _, key := range cardKeys {
+		dlpViews = append(dlpViews, responseDLPView{key, key})
+	}
+	result, dlpMatches, droppedDLP := scanResponseViewsWithCards(ctx, sc, opts, []string{joinResponseText(text, envelopeText)}, dlpViews)
 	if result.Failed() {
 		return jsonrpc.ScanVerdict{ID: rpc.ID, Action: config.ActionBlock, Error: "response scan failed: " + result.ScanError}
 	}
@@ -798,6 +877,7 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 		}
 	}
 	dlpMatches = append(dlpMatches, sc.ScanNumericChannelForKnownValues(numeric)...)
+	dlpMatches = appendUniqueA2ADLPFindings(dlpMatches, responseJSONCardMatches(sc, trimmed, true))
 	if result.Clean && len(dlpMatches) == 0 {
 		return jsonrpc.ScanVerdict{ID: rpc.ID, Clean: true}
 	}
@@ -805,7 +885,7 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 	return jsonrpc.ScanVerdict{
 		ID:         rpc.ID,
 		Clean:      false,
-		Action:     responseScanAction(sc, opts),
+		Action:     responseFindingAction(sc, opts, result.Matches, dlpMatches),
 		Matches:    result.Matches,
 		DLPMatches: dlpMatches,
 	}
@@ -1174,6 +1254,19 @@ type A2AResponseOpts struct {
 	// scanning is disabled or the response is ordinary MCP traffic.
 	// The zero value preserves ScanResponse (no suppression) behavior.
 	ScanOpts ResponseScanOptions
+	// ScanTimeout bounds the field-aware A2A response and Agent Card scans.
+	// A scan that runs past it blocks as incomplete. Zero leaves the scan
+	// unbounded.
+	ScanTimeout time.Duration
+}
+
+// scanContext returns the context for one A2A response scan, bounded by
+// ScanTimeout when it is positive.
+func (o *A2AResponseOpts) scanContext() (context.Context, context.CancelFunc) {
+	if o.ScanTimeout > 0 {
+		return context.WithTimeout(context.Background(), o.ScanTimeout)
+	}
+	return context.Background(), func() {}
 }
 
 // ScanResponseA2A scans a JSON-RPC 2.0 response with optional A2A-aware
@@ -1203,7 +1296,8 @@ func ScanResponseA2A(line []byte, sc *scanner.Scanner, a2aOpts *A2AResponseOpts)
 			return verdict
 		}
 		verdict, injection := scanA2AResponseDispatchClass(line, sc, a2aOpts)
-		if !verdict.Clean {
+		numberOnly := verdict.Action == config.ActionWarn && verdict.Error == "" && len(verdict.Matches) == 0 && scanner.OnlyInformational(verdict.DLPMatches)
+		if !verdict.Clean && !numberOnly {
 			verdict.Action = config.StricterAction(a2aDefaultAction(a2aOpts.Cfg), verdict.Action)
 			// This path replaces the response scan, so the response action
 			// still applies. Without the optional layer, that action is the
@@ -1289,7 +1383,9 @@ func scanA2AResponseDispatchClass(line []byte, sc *scanner.Scanner, a2aOpts *A2A
 	}
 
 	// All other A2A methods: field-aware body scanning.
-	result := ScanA2AResponseBody(context.Background(), line, sc, a2aOpts.Cfg)
+	ctx, cancel := a2aOpts.scanContext()
+	defer cancel()
+	result := ScanA2AResponseBody(ctx, line, sc, a2aOpts.Cfg)
 	return mergeA2AResponseVerdicts(a2aScanToVerdict(rpcID, result), joined), len(result.InjectFindings) > 0 || len(joined.Matches) > 0
 }
 
@@ -1333,14 +1429,18 @@ func scanAgentCardRPCResponse(line []byte, sc *scanner.Scanner, a2aOpts *A2AResp
 	// error.message and error.data. Don't skip scanning just because
 	// the response is an error instead of a result.
 	if len(rpc.Error) > 0 && string(rpc.Error) != jsonrpc.Null {
-		errResult := ScanA2AResponseBody(context.Background(), line, sc, a2aOpts.Cfg)
+		ctx, cancel := a2aOpts.scanContext()
+		defer cancel()
+		errResult := ScanA2AResponseBody(ctx, line, sc, a2aOpts.Cfg)
 		return mergeA2AResponseVerdicts(a2aScanToVerdict(rpcID, errResult), joined), len(errResult.InjectFindings) > 0 || len(joined.Matches) > 0
 	}
 	if len(rpc.Result) == 0 || string(rpc.Result) == jsonrpc.Null {
 		return mergeA2AResponseVerdicts(jsonrpc.ScanVerdict{ID: rpcID, Clean: true}, joined), len(joined.Matches) > 0
 	}
+	ctx, cancel := a2aOpts.scanContext()
+	defer cancel()
 	cardResult := scanAgentCard(
-		context.Background(), rpc.Result, sc,
+		ctx, rpc.Result, sc,
 		a2aOpts.Baseline, a2aOpts.CardKey, agentCardScanOptions{cfg: a2aOpts.Cfg, commitBaseline: joined.Clean, confirmAcceptance: a2aOpts.ConfirmCardAcceptance},
 	)
 	if cardResult.DriftAdopted && a2aOpts.OnCardDriftAdopted != nil {

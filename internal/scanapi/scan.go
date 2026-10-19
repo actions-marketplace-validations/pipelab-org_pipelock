@@ -109,11 +109,14 @@ func (h *Handler) scanDLP(ctx context.Context, cfg *config.Config, sc *scanner.S
 		Kind:   req.Kind,
 		ScanID: generateScanID(),
 	}
-	if result.Clean && len(urlResults.results) == 0 && !urlResults.truncated {
+	if len(result.Matches) == 0 && len(urlResults.results) == 0 && !urlResults.truncated {
 		resp.Decision = DecisionAllow
 	} else {
 		resp.Decision = DecisionDeny
-		if !result.Clean {
+		if len(urlResults.results) == 0 && !urlResults.truncated {
+			resp.Decision = cardDLPDecision(result.Matches)
+		}
+		if len(result.Matches) > 0 {
 			resp.Findings = append(resp.Findings, dlpFindings(result, req.Options)...)
 		}
 		for _, urlResult := range urlResults.results {
@@ -356,6 +359,7 @@ func (h *Handler) scanToolCall(
 	// Uses extract.AllStringsFromJSON (keys AND values) because secrets
 	// can be encoded as JSON object keys. See spec: tool_call wiring detail.
 	var argStrings []string
+	var cardAtoms []extract.DLPAtom
 	if len(req.Input.Arguments) > 0 && string(req.Input.Arguments) != jsonNull {
 		extracted := extract.AllStringsFromJSONResult(json.RawMessage(req.Input.Arguments))
 		if extracted.Truncated {
@@ -369,6 +373,7 @@ func (h *Handler) scanToolCall(
 			return resp, http.StatusOK
 		}
 		argStrings = extracted.Strings
+		cardAtoms = extracted.Atoms
 	}
 	scanText := strings.Join(argStrings, " ")
 
@@ -383,24 +388,55 @@ func (h *Handler) scanToolCall(
 	// the API silently declined to scan what it was asked to. The sibling
 	// kinds (url / dlp / prompt_injection) all scan unconditionally; tool_call
 	// now matches that contract.
+	var dlpMatches []scanner.TextDLPMatch
+	var injResult scanner.ResponseScanResult
 	if scanText != "" {
-		dlpResult := sc.ScanTextForDLP(ctx, scanText)
+		dlpResult := sc.ScanTextForDLPWithTypedCardView(ctx, scanText, extract.JoinCardAtoms(cardAtoms, " "))
+		// A joined view cannot retain each leaf's scalar or encoded spelling.
+		// Inspect leaves independently, preserving numeric card views as the
+		// inline MCP input scanner does. Number-only evidence must not skip
+		// a later enforcing finding.
+		if dlpResult.Clean || scanner.OnlyInformational(dlpResult.Matches) {
+			for _, atom := range cardAtoms {
+				if err := ctx.Err(); err != nil {
+					return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+				}
+				leaf := sc.ScanTextForDLPWithCardView(ctx, atom.Text, atom.Card)
+				if len(leaf.Matches) > 0 {
+					dlpResult.Matches = appendNewDLPMatches(dlpResult.Matches, leaf.Matches)
+					dlpResult.Clean = !scanner.HasEnforcingMatch(dlpResult.Matches)
+					if !scanner.OnlyInformational(leaf.Matches) {
+						break
+					}
+				}
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
 		}
-		if !dlpResult.Clean {
-			resp.Decision = DecisionDeny
-			resp.Findings = append(resp.Findings, dlpFindings(dlpResult, req.Options)...)
+		if len(dlpResult.Matches) > 0 {
+			dlpMatches = dlpResult.Matches
 		}
 
-		injResult := sc.ScanResponse(ctx, scanText)
+		injResult = sc.ScanResponse(ctx, scanText)
 		if err := ctx.Err(); err != nil {
 			return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
 		}
 		if !injResult.Clean {
 			resp.Decision = DecisionDeny
-			resp.Findings = append(resp.Findings, injectionFindings(injResult, req.Options)...)
 		}
+	}
+	if resp.Decision != DecisionDeny && !scanner.HasEnforcingMatch(dlpMatches) {
+		dlpMatches = appendNewDLPMatches(dlpMatches, sc.ScanJSONCardRuns(ctx, string(req.Input.Arguments)))
+	}
+	if len(dlpMatches) > 0 {
+		if resp.Decision != DecisionDeny {
+			resp.Decision = cardDLPDecision(dlpMatches)
+		}
+		resp.Findings = append(resp.Findings, dlpFindings(scanner.TextDLPResult{Matches: dlpMatches}, req.Options)...)
+	}
+	if len(injResult.Matches) > 0 {
+		resp.Findings = append(resp.Findings, injectionFindings(injResult, req.Options)...)
 	}
 
 	// Stage 3: Policy check.
@@ -491,6 +527,9 @@ func dlpFindings(result scanner.TextDLPResult, opts *RequestOptions) []Finding {
 			RuleID:   "DLP-" + m.PatternName,
 			Severity: m.Severity,
 			Message:  "Secret-like token detected (" + m.PatternName + ")",
+		}
+		if m.IsInformational() {
+			f.Message = "Informational JSON card run detected (action=warn)"
 		}
 		if opts != nil && opts.IncludeEvidence {
 			encoding := m.Encoded
@@ -607,4 +646,37 @@ func errorResponse(kind, code, message string, retryable bool) Response {
 			{Code: code, Message: message, Retryable: retryable},
 		},
 	}
+}
+
+// appendNewDLPMatches adds leaf matches the joined scan has not already
+// reported. A leaf that is itself the whole joined text, such as a lone string
+// holding serialized JSON, repeats the joined match, and the response promises
+// one finding per scanner match. Identity matches the MCP input merge: pattern,
+// encoding, and whether the match is informational card evidence.
+func appendNewDLPMatches(existing, incoming []scanner.TextDLPMatch) []scanner.TextDLPMatch {
+	type matchKey struct {
+		name          string
+		encoded       string
+		informational bool
+	}
+	seen := make(map[matchKey]struct{}, len(existing)+len(incoming))
+	for _, match := range existing {
+		seen[matchKey{name: match.PatternName, encoded: match.Encoded, informational: match.IsInformational()}] = struct{}{}
+	}
+	for _, match := range incoming {
+		key := matchKey{name: match.PatternName, encoded: match.Encoded, informational: match.IsInformational()}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		existing = append(existing, match)
+	}
+	return existing
+}
+
+func cardDLPDecision(matches []scanner.TextDLPMatch) string {
+	if scanner.OnlyInformational(matches) {
+		return DecisionWarn
+	}
+	return DecisionDeny
 }

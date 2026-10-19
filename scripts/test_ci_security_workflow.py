@@ -28,8 +28,7 @@ BUILD_GATE_RESULTS = (
     "CROSS_TARGET_RESULT",
     "HELM_RESULT",
     "BUILD_BINARIES_RESULT",
-    "REVIEW_TESTS_RESULT",
-    "REVIEW_SOURCE_RESULT",
+    "AGENT_REVIEW_CONTRACT_RESULT",
 )
 # The subset a documentation-only pull request skips on purpose.
 DOCS_SKIPPABLE_RESULTS = (
@@ -37,7 +36,6 @@ DOCS_SKIPPABLE_RESULTS = (
     "LINT_ENTERPRISE_RESULT",
     "CROSS_TARGET_RESULT",
     "HELM_RESULT",
-    "REVIEW_TESTS_RESULT",
     "BUILD_BINARIES_RESULT",
 )
 
@@ -187,8 +185,7 @@ exit "$DEFAULT_STATUS"
                 "test-cross-target",
                 "helm",
                 "build-binaries",
-                "pr-review-tests",
-                "pr-review-source",
+                "agent-review-contract",
             },
             {dependency.strip() for dependency in gate_needs.group(1).split(",")},
         )
@@ -205,7 +202,6 @@ exit "$DEFAULT_STATUS"
             "CHANGED_FILES_RESULT": "success",
             "DOCS_ONLY": "false",
             "EVENT_NAME": "pull_request",
-            "REPOSITORY": "pipelab-org/pipelock",
         })
         success = subprocess.run(
             ["bash", "-euo", "pipefail", "-c", script],
@@ -215,19 +211,6 @@ exit "$DEFAULT_STATUS"
             capture_output=True,
         )
         self.assertEqual(0, success.returncode, success.stderr)
-
-        for evidence in ("success", "skipped", "failure", "cancelled", ""):
-            with self.subTest(repository="fork", evidence=evidence):
-                fork_env = dict(base_env, REPOSITORY="contributor/pipelock", REVIEW_SOURCE_RESULT=evidence)
-                fork = subprocess.run(
-                    ["bash", "-euo", "pipefail", "-c", script], check=False,
-                    env=fork_env, text=True, capture_output=True,
-                )
-                if evidence in {"success", "skipped"}:
-                    self.assertEqual(0, fork.returncode, fork.stderr)
-                else:
-                    self.assertNotEqual(0, fork.returncode)
-                    self.assertIn("review source identity was not verified", fork.stderr)
 
         for name in result_names:
             for evidence in ("failure", "cancelled", "skipped", ""):
@@ -257,7 +240,6 @@ exit "$DEFAULT_STATUS"
                 "EVENT_NAME": event,
                 "CHANGED_FILES_RESULT": classifier,
                 "DOCS_ONLY": "false",
-                "REPOSITORY": "pipelab-org/pipelock",
             })
             return subprocess.run(
                 ["bash", "-euo", "pipefail", "-c", script], check=False, env=env, text=True, capture_output=True
@@ -274,7 +256,6 @@ exit "$DEFAULT_STATUS"
         script = step_script(self.build, "Report required build evidence")
         base_env = os.environ.copy()
         base_env.update({name: "success" for name in BUILD_GATE_RESULTS})
-        base_env.update({"REPOSITORY": "pipelab-org/pipelock"})
 
         def run(event: str, classifier: str, docs: str, **results: str) -> int:
             env = base_env | {"EVENT_NAME": event, "CHANGED_FILES_RESULT": classifier, "DOCS_ONLY": docs} | results
@@ -297,7 +278,7 @@ exit "$DEFAULT_STATUS"
             with self.subTest(failed=name):
                 self.assertNotEqual(0, run("pull_request", "success", "true", **(skipped | {name: "failure"})))
         # Producers a documentation-only change still needs can never skip.
-        for name in sorted(set(BUILD_GATE_RESULTS) - set(DOCS_SKIPPABLE_RESULTS) - {"REVIEW_SOURCE_RESULT"}):
+        for name in sorted(set(BUILD_GATE_RESULTS) - set(DOCS_SKIPPABLE_RESULTS)):
             with self.subTest(always_required=name):
                 self.assertNotEqual(0, run("pull_request", "success", "true", **(skipped | {name: "skipped"})))
 

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,11 @@ type DLPMatch struct {
 	// Contributors identifies only the retained source requests whose bytes
 	// overlap this occurrence. Values are opaque, caller-sanitized identifiers.
 	Contributors [][]byte
+}
+
+// IsInspectionLimit preserves the refusal class on contributor-aware evidence.
+func (m DLPMatch) IsInspectionLimit() bool {
+	return (TextDLPMatch{PatternName: m.PatternName}).IsInspectionLimit()
 }
 
 // MaxFragmentSourceRequestIDBytes bounds provenance metadata independently of
@@ -904,10 +910,16 @@ func scanOneFragmentContinuityMemo(ctx context.Context, sc *Scanner, fragments [
 		return nil
 	}
 	result := sc.ScanTextForDLP(ctx, text)
-	if result.Clean && len(result.InformationalMatches) == 0 {
+	if result.Clean && len(result.Matches) == 0 && len(result.InformationalMatches) == 0 {
 		if memo != nil {
 			memo.store(key, text)
 		}
+		return nil
+	}
+
+	result.Matches = slices.DeleteFunc(result.Matches, func(m TextDLPMatch) bool { return m.IsInformational() })
+	if len(result.Matches) == 0 {
+		// Warnings were emitted by the joined scan. Do not memoize them.
 		return nil
 	}
 
@@ -951,7 +963,7 @@ func scanOneFragmentContinuityMemo(ctx context.Context, sc *Scanner, fragments [
 			var rawTargets []TextDLPMatch
 			invalidTargetFound := false
 			for _, match := range maskedResult.Matches {
-				if match.PatternName != patternName {
+				if match.PatternName != patternName || match.IsInformational() {
 					continue
 				}
 				span := match.Span()
@@ -1081,8 +1093,14 @@ func imageSplicedFragmentMatches(ctx context.Context, sc *Scanner, excised, deco
 			}
 			budget--
 			var target *TextDLPMatch
-			for _, m := range sc.ScanTextForDLPQuiet(ctx, string(masked)).Matches {
-				if m.PatternName == name {
+			rescanned := sc.ScanTextForDLPQuiet(ctx, string(masked)).Matches
+			if len(decoded) > 0 {
+				// Decoded image bytes make the combined window cease to be JSON.
+				// Keep the surrounding document's typed runs in the rescan too.
+				rescanned = append(rescanned, sc.ScanJSONCardRuns(ctx, string(masked[:len(excised)]))...)
+			}
+			for _, m := range rescanned {
+				if m.PatternName == name && !m.IsInformational() {
 					target = &m
 					break
 				}

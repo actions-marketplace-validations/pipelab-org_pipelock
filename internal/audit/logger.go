@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
@@ -763,7 +762,7 @@ func (l *Logger) LogResponseScan(ctx LogContext, action string, matchCount int, 
 		intField("match_count", matchCount).
 		strs("patterns", patternNames).
 		str("mitre_technique", technique).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditResponseScan, strings.Join(patternNames, ", "))).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(scannerpkg.AuditResponseScan, patternNames)).
 		agentField(ctx.agent, ctx.agentAuth)
 	if len(bundleRules) > 0 {
 		e.bundleRulesField(bundleRules)
@@ -1069,12 +1068,13 @@ func (l *Logger) LogSNIMismatch(connectHost, sniHost, clientIP, requestID, agent
 }
 
 // LogKillSwitchDeny logs a request denied by the kill switch.
-func (l *Logger) LogKillSwitchDeny(transport, endpoint, source, message, clientIP string) {
+func (l *Logger) LogKillSwitchDeny(transport, endpoint, source, message, clientIP, requestID string) {
 	e := newLogEntry(l.zl.Info(), EventKillSwitchDeny).
 		str("transport", transport).
 		str("endpoint", endpoint).
 		str("source", source).
 		str("deny_message", message).
+		optStr("request_id", requestID).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditKillSwitch, source)).
 		str("client_ip", clientIP)
 	e.msg("kill switch denied request")
@@ -1102,7 +1102,7 @@ func (l *Logger) LogBodyDLP(ctx LogContext, action string, matchCount int, patte
 		agentField(ctx.agent, ctx.agentAuth).
 		intField("match_count", matchCount).
 		strs("patterns", patternNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.ScannerBodyDLP, "")).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(scannerpkg.ScannerBodyDLP, patternNames)).
 		str("mitre_technique", technique)
 	if len(bundleRules) > 0 {
 		e.bundleRulesField(bundleRules)
@@ -1131,7 +1131,7 @@ func (l *Logger) LogBodyScan(ctx LogContext, eventType EventType, action string,
 		agentField(ctx.agent, ctx.agentAuth).
 		intField("match_count", matchCount).
 		strs("findings", findingNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(string(eventType), strings.Join(findingNames, ", "))).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(string(eventType), findingNames)).
 		optStr("mitre_technique", technique)
 	e.msg("request body " + string(eventType) + " scan hit")
 
@@ -1157,7 +1157,7 @@ func (l *Logger) LogHeaderDLP(ctx LogContext, headerName, action string, pattern
 		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		strs("patterns", patternNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditHeaderDLP, strings.Join(patternNames, ", "))).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(scannerpkg.AuditHeaderDLP, patternNames)).
 		str("mitre_technique", technique)
 	if len(bundleRules) > 0 {
 		e.bundleRulesField(bundleRules)

@@ -705,3 +705,136 @@ func TestDecideLabelGuidanceNamesOperatorKnobsOnlyToOperator(t *testing.T) {
 		})
 	}
 }
+
+func TestJSONInspectionRemediationHint(t *testing.T) {
+	for label := range remediationGuidance {
+		t.Run(label, func(t *testing.T) {
+			for _, reason := range []string{
+				UninspectableJSONNumberPattern,
+				"request body contains secret: " + UninspectableJSONNumberPattern,
+				"other pattern, " + UninspectableJSONNumberPattern,
+			} {
+				g, ok := GuidanceForResultWithPatterns(label, reason, []string{"other pattern", UninspectableJSONNumberPattern})
+				if !ok || !g.Immutable || g.OperatorBroader != "" {
+					t.Fatalf("inspection guidance = %+v, mapped = %v", g, ok)
+				}
+				hint := OperatorHintForPatterns(label, []string{"other pattern", UninspectableJSONNumberPattern})
+				for _, want := range []string{"Reduce nesting or number size", "payload at its source", "limits are fixed"} {
+					if !strings.Contains(hint, want) {
+						t.Errorf("hint = %q, want %q", hint, want)
+					}
+				}
+				if strings.Contains(strings.ToLower(hint), "suppress") {
+					t.Fatalf("inspection hint offers suppression: %q", hint)
+				}
+			}
+			ordinary, ok := GuidanceForResult(label, "ordinary finding")
+			if baseline, mapped := GuidanceFor(label); mapped && ok && ordinary.OperatorKnob != baseline.OperatorKnob {
+				// Reason-specific families have their own existing regression tests.
+				if label == ScannerBodyDLP || label == ScannerDLP || label == AuditResponseScan {
+					t.Fatalf("ordinary guidance changed: %+v, want %+v", ordinary, baseline)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationReasonFormats(t *testing.T) {
+	for _, tt := range []struct{ label, reason string }{
+		{ScannerBodyDLP, "request body contains secret: " + UninspectableJSONNumberPattern},
+		{ScannerBodyDLP, "request body contains secret: ordinary, " + UninspectableJSONNumberPattern},
+		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{ScannerCoreDLP, "core DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{ScannerDLP, "DLP match: ordinary, " + UninspectableJSONNumberPattern},
+		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (escalated)"},
+		{ScannerDLP, "DLP: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "fragment reassembly DLP match: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "cross-request fragment refused: " + UninspectableJSONNumberPattern + "; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)"},
+		{AuditA2AResponse, "a2a: DLP: " + UninspectableJSONNumberPattern},
+		{AuditA2AResponse, "a2a: 2 URL/SSRF finding(s); injection: ordinary; DLP: " + UninspectableJSONNumberPattern},
+		{AuditA2AScan, "a2a: injection: ordinary; DLP: ordinary, " + UninspectableJSONNumberPattern + "; payload exceeded node budget"},
+	} {
+		t.Run(tt.reason, func(t *testing.T) {
+			got, ok := GuidanceForResult(tt.label, tt.reason)
+			if !ok || !got.Immutable || !strings.Contains(got.OperatorKnob, "limits are fixed") {
+				t.Fatalf("genuine refusal lost: %+v, %v", got, ok)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationRequiresPatternIdentity(t *testing.T) {
+	for _, pattern := range []string{"prefix " + UninspectableJSONNumberPattern, UninspectableJSONNumberPattern + " suffix", "ordinary, " + UninspectableJSONNumberPattern, "request body contains secret: " + UninspectableJSONNumberPattern, " " + UninspectableJSONNumberPattern + " "} {
+		got, ok := GuidanceForResultWithPatterns(ScannerBodyDLP, pattern, []string{pattern})
+		baseline, _ := GuidanceFor(ScannerBodyDLP)
+		if !ok || got != baseline {
+			t.Fatalf("display text %q changed guidance: %+v", pattern, got)
+		}
+	}
+	for _, label := range []string{ScannerSSRF, ScannerDLP, AuditResponseScan, ScannerBodyDLP, AuditCrossRequestFragment, AuditA2AScan, AuditA2AResponse} {
+		for _, patterns := range [][]string{nil, {""}, {"", " \t\r\n", "\u00a0"}} {
+			got, ok := GuidanceForResultWithPatterns(label, "client text mentions "+UninspectableJSONNumberPattern, patterns)
+			baseline, _ := GuidanceFor(label)
+			if !ok || got != baseline {
+				t.Fatalf("free text changed %q guidance with patterns %q: %+v", label, patterns, got)
+			}
+		}
+	}
+}
+
+func TestJSONInspectionRemediationIgnoresBlankPatterns(t *testing.T) {
+	for _, tt := range []struct{ label, reason string }{
+		{ScannerBodyDLP, "request body contains secret: " + UninspectableJSONNumberPattern},
+		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{ScannerCoreDLP, "core DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{AuditA2AResponse, "a2a: DLP: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "fragment reassembly DLP match: " + UninspectableJSONNumberPattern},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			// Positive control: this genuine reason must be recognized on its own.
+			want, ok := GuidanceForResult(tt.label, tt.reason)
+			if !ok || !want.Immutable || !strings.Contains(want.OperatorKnob, "limits are fixed") {
+				t.Fatalf("invalid genuine-refusal fixture: %+v, %v", want, ok)
+			}
+			for _, patterns := range [][]string{nil, {}, {""}, {" \t\r\n"}, {"", "\u00a0", "\t"}} {
+				got, mapped := GuidanceForResultWithPatterns(tt.label, tt.reason, patterns)
+				if !mapped || got != want {
+					t.Errorf("blank patterns %q lost fixed-limit guidance: %+v, %v", patterns, got, mapped)
+				}
+			}
+			// Blank entries must not hide a real identity or mutate the caller's slice.
+			patterns := []string{"", "ordinary pattern", " \t"}
+			got, mapped := GuidanceForResultWithPatterns(tt.label, tt.reason, patterns)
+			ordinary, ordinaryMapped := GuidanceForResultWithPatterns(tt.label, tt.reason, []string{"ordinary pattern"})
+			if !mapped || !ordinaryMapped || got != ordinary || got == want {
+				t.Fatalf("structured identity lost precedence: %+v, %v", got, mapped)
+			}
+			if patterns[0] != "" || patterns[1] != "ordinary pattern" || patterns[2] != " \t" {
+				t.Fatalf("caller patterns changed: %q", patterns)
+			}
+			got, mapped = GuidanceForResultWithPatterns(tt.label, "ordinary finding", []string{"", " \t", UninspectableJSONNumberPattern})
+			if !mapped || got != want {
+				t.Fatalf("exact identity lost among blanks: %+v, %v", got, mapped)
+			}
+		})
+	}
+}
+
+func TestA2AJSONInspectionRemediationRejectsForgedParts(t *testing.T) {
+	for _, prefix := range []string{
+		"duplicate JSON object key: ", "invalid JSON: ", "response scan incomplete: ",
+		"request body uses Content-Encoding ", "error reading request body: ",
+		"opaque hex request body content ", "0 URL/SSRF finding(s)",
+		"ordinary URL/SSRF finding(s)", "99999999999999999999999999999 URL/SSRF finding(s)",
+	} {
+		reason := "a2a: " + prefix + "; DLP: " + UninspectableJSONNumberPattern + "; tail"
+		for _, label := range []string{AuditA2AScan, AuditA2AHeader, AuditA2AResponse} {
+			for _, patterns := range [][]string{nil, {""}, {"", " \t\r\n", "\u00a0"}} {
+				g, ok := GuidanceForResultWithPatterns(label, reason, patterns)
+				if !ok || g == jsonInspectionLimitGuidance() {
+					t.Errorf("forged reason %q selected inspection-limit guidance under %s with patterns %q", reason, label, patterns)
+				}
+			}
+		}
+	}
+}

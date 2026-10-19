@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 )
 
 // maxExtractDepth bounds recursion depth when extracting strings from JSON.
@@ -811,6 +813,12 @@ func appendJSONLeafValuePartial(state *jsonLeafPartialState, path []byte, value 
 // the JSON contains content beyond maxExtractDepth, meaning callers that make
 // allow/block decisions must fail closed instead of trusting partial strings.
 type JSONStringsResult struct {
+	// CardStrings parallels Strings only for type-aware extraction; literal strings are unchanged.
+	CardStrings []string
+	// Atoms preserves source order and JSON number provenance for card joins,
+	// including key provenance and null barriers. Card joins omit keys;
+	// Strings and CardStrings use sorted keys.
+	Atoms     []DLPAtom
 	Strings   []string
 	Truncated bool
 }
@@ -827,7 +835,14 @@ func AllStringsFromJSON(raw json.RawMessage) []string {
 // AllStringsFromJSONResult recursively extracts all string values AND keys from
 // arbitrary JSON and reports whether extraction hit the nesting cap.
 func AllStringsFromJSONResult(raw json.RawMessage) JSONStringsResult {
-	var result []string
+	if !json.Valid(raw) {
+		return JSONStringsResult{}
+	}
+	var result, cards []string
+	appendAtom := func(text, card string) {
+		result = append(result, text)
+		cards = append(cards, card)
+	}
 	truncated := false
 	var extract func(v interface{}, depth int)
 	extract = func(v interface{}, depth int) {
@@ -837,11 +852,12 @@ func AllStringsFromJSONResult(raw json.RawMessage) JSONStringsResult {
 		}
 		switch val := v.(type) {
 		case string:
-			result = append(result, val)
-		case float64:
-			result = append(result, strconv.FormatFloat(val, 'f', -1, 64))
+			appendAtom(val, val)
+		case json.Number:
+			appendAtom(val.String(), jsonnumber.IntegralView(val))
 		case bool:
-			result = append(result, strconv.FormatBool(val))
+			text := strconv.FormatBool(val)
+			appendAtom(text, text)
 		case []interface{}:
 			for _, item := range val {
 				extract(item, depth+1)
@@ -856,16 +872,17 @@ func AllStringsFromJSONResult(raw json.RawMessage) JSONStringsResult {
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				result = append(result, k)
+				appendAtom(k, k)
 				extract(val[k], depth+1)
 			}
 		}
 	}
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err == nil {
+	if err := DecodeJSON(raw, &parsed); err == nil {
 		extract(parsed, 0)
 	}
-	return JSONStringsResult{Strings: result, Truncated: truncated}
+	ordered := AllStringsFromJSONOrderedResult(raw)
+	return JSONStringsResult{Strings: result, CardStrings: cards, Atoms: ordered.Atoms, Truncated: truncated || ordered.Truncated}
 }
 
 // AllStringsFromJSONOrdered extracts string-ish JSON tokens in source order,
@@ -886,6 +903,14 @@ func AllStringsFromJSONOrderedResult(raw json.RawMessage) JSONStringsResult {
 	dec.UseNumber()
 
 	var result []string
+	var atoms []DLPAtom
+	appendAtom := func(text, card string, number, key bool) {
+		atoms = append(atoms, DLPAtom{Text: text, Card: card, Number: number, Key: key})
+	}
+	type frame struct {
+		object, expectKey bool
+	}
+	var stack []frame
 	depth := 0
 	truncated := false
 	for {
@@ -901,27 +926,60 @@ func AllStringsFromJSONOrderedResult(raw json.RawMessage) JSONStringsResult {
 			switch v {
 			case '{', '[':
 				depth++
-				if depth > maxExtractDepth {
+				stack = append(stack, frame{object: v == '{', expectKey: v == '{'})
+				// depth counts the open container, so this container sits at
+				// recursive value depth depth-1. Match the recursive walk: an
+				// empty container at the limit is inspectable; content past
+				// it is truncated.
+				if depth > maxExtractDepth+1 {
 					truncated = true
 				}
 			case '}', ']':
 				if depth > 0 {
 					depth--
+					stack = stack[:len(stack)-1]
 				}
 			}
 		case string:
+			key := len(stack) > 0 && stack[len(stack)-1].object && stack[len(stack)-1].expectKey
+			if depth > maxExtractDepth {
+				truncated = true
+			}
 			if depth <= maxExtractDepth {
 				result = append(result, v)
+				appendAtom(v, v, false, key)
+			}
+			if key {
+				stack[len(stack)-1].expectKey = false
+				continue
 			}
 		case json.Number:
+			if depth > maxExtractDepth {
+				truncated = true
+			}
 			if depth <= maxExtractDepth {
 				result = append(result, v.String())
+				appendAtom(v.String(), jsonnumber.IntegralView(v), true, false)
 			}
 		case bool:
+			if depth > maxExtractDepth {
+				truncated = true
+			}
 			if depth <= maxExtractDepth {
 				result = append(result, strconv.FormatBool(v))
+				appendAtom(strconv.FormatBool(v), strconv.FormatBool(v), false, false)
+			}
+		case nil:
+			if depth > maxExtractDepth {
+				truncated = true
+			}
+			if depth <= maxExtractDepth {
+				appendAtom("null", "null", false, false)
 			}
 		}
+		if len(stack) > 0 && stack[len(stack)-1].object && !stack[len(stack)-1].expectKey {
+			stack[len(stack)-1].expectKey = true
+		}
 	}
-	return JSONStringsResult{Strings: result, Truncated: truncated}
+	return JSONStringsResult{Strings: result, Atoms: atoms, Truncated: truncated}
 }

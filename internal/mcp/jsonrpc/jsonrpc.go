@@ -12,10 +12,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -26,6 +28,10 @@ const Version = "2.0"
 // Null is the JSON literal "null", used to detect nil-equivalent
 // json.RawMessage values that are non-nil Go slices.
 const Null = "null"
+
+// fallbackTextSeparator joins values from a non-standard JSON shape. The
+// space survives DLP normalization; the newline keeps values on their own line.
+const fallbackTextSeparator = " \n"
 
 // ContentBlock represents a single content block in an MCP tool result.
 type ContentBlock struct {
@@ -149,6 +155,10 @@ type ScanVerdict struct {
 // a separate signal from Truncated and has the same consequence: the strings
 // are partial and the caller must block.
 type ExtractStringsResult struct {
+	// CardAtoms retains all scalar values, including values omitted from Strings.
+	CardAtoms []extract.DLPAtom
+	// StringPositions maps Strings to its positions in CardAtoms.
+	StringPositions  []int
 	Strings          []string
 	Truncated        bool
 	IncompleteReason string
@@ -163,6 +173,11 @@ type ExtractKeysResult struct {
 
 // TextResult is the bounded text extraction result.
 type TextResult struct {
+	// CardText preserves string types while classifying complete text documents.
+	// It excludes object keys, which CardKeys retains for individual scans.
+	CardText string
+	// CardKeys retain ordinary whole-key scans without joining keys into cards.
+	CardKeys  []string
 	Text      string
 	Truncated bool
 	// IncompleteReason is non-empty when media inspection ran out of budget.
@@ -234,11 +249,13 @@ func extractTextResult(raw json.RawMessage, includeNumeric bool, budget *MediaTe
 	var tr ToolResult
 	if err := json.Unmarshal(raw, &tr); err == nil && (len(tr.Content) > 0 || tr.StructuredContent != nil) {
 		var texts []string
+		documents := make(map[int]string)
 		for _, block := range tr.Content {
 			// Extract text from ALL content blocks, not just type=="text".
 			// Non-text blocks (image, resource) may carry prompt injection
 			// in their text field.
 			if block.Text != "" {
+				documents[len(texts)] = jsonnumber.StructuredCardView(block.Text, extract.MaxExtractDepth)
 				texts = append(texts, block.Text)
 			}
 			// Embedded resources carry their rendered text under resource.text,
@@ -246,6 +263,7 @@ func extractTextResult(raw json.RawMessage, includeNumeric bool, budget *MediaTe
 			// agent-visible response content while deliberately excluding opaque
 			// resource blobs from prompt scanning.
 			if block.Resource != nil && block.Resource.Text != "" {
+				documents[len(texts)] = jsonnumber.StructuredCardView(block.Resource.Text, extract.MaxExtractDepth)
 				texts = append(texts, block.Resource.Text)
 			}
 			// resource_link metadata is also rendered to the agent. Keep URI
@@ -277,6 +295,8 @@ func extractTextResult(raw json.RawMessage, includeNumeric bool, budget *MediaTe
 		if reason := budget.Reason(); reason != "" {
 			return TextResult{IncompleteReason: reason}
 		}
+		cards := slices.Clone(texts)
+		cards = append(cards, ResponseCardText(structured.CardAtoms))
 		texts = append(texts, structured.Strings...)
 		keys := ExtractKeysFromJSONResult(tr.StructuredContent)
 		if keys.Truncated {
@@ -286,17 +306,42 @@ func extractTextResult(raw json.RawMessage, includeNumeric bool, budget *MediaTe
 		// Always return after a successful ToolResult parse, even when
 		// texts is empty. Falling through to ExtractStringsFromJSON would
 		// feed base64 media in data/blob/raw fields into prompt scanning.
-		return TextResult{Text: strings.Join(texts, " "), Numeric: numeric}
+		for i, view := range documents {
+			cards[i] = view
+		}
+		return TextResult{Text: strings.Join(texts, " "), CardText: strings.Join(cards, " "), CardKeys: keys.Keys, Numeric: numeric}
 	}
 
 	// Fallback: recursively extract all string values from arbitrary JSON.
 	// Catches non-standard result shapes (plain string, nested objects, etc).
+	// DLP normalization deletes the newline, so the space keeps each value's
+	// word boundary, as the typed content join above does.
 	extracted := ExtractStringsFromJSONResult(raw)
 	if len(extracted.Strings) > 0 {
-		return TextResult{Text: strings.Join(extracted.Strings, "\n"), Truncated: extracted.Truncated, Numeric: numeric}
+		joined := strings.Join(extracted.Strings, fallbackTextSeparator)
+		cards := ResponseCardText(extract.AllStringsFromJSONOrderedResult(raw).Atoms)
+		return TextResult{Text: joined, CardText: cards, Truncated: extracted.Truncated, Numeric: numeric}
 	}
 
 	return TextResult{Truncated: extracted.Truncated, Numeric: numeric}
+}
+
+// ResponseCardText joins response scalar values without discarding barriers.
+// Keys are scanned separately. Numbers stay on the numeric channel, with null
+// retaining their position here. Empty strings must retain their join position.
+func ResponseCardText(atoms []extract.DLPAtom) string {
+	var cards []string
+	for _, atom := range atoms {
+		if atom.Key {
+			continue
+		}
+		if atom.Number {
+			cards = append(cards, Null)
+		} else {
+			cards = append(cards, atom.Card)
+		}
+	}
+	return strings.Join(cards, fallbackTextSeparator)
 }
 
 // ExtractNumericLeaves returns every numeric leaf in raw, in the same
@@ -367,14 +412,16 @@ func extractVisibleStrings(raw json.RawMessage, budget *MediaTextBudget) Extract
 		budget = &MediaTextBudget{}
 	}
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
 		return ExtractStringsResult{}
 	}
 
 	var result []string
+	var atoms []extract.DLPAtom
+	var positions []int
 	truncated := false
-	var extract func(interface{}, int, bool)
-	extract = func(v interface{}, depth int, mediaCandidate bool) {
+	var visit func(interface{}, int, bool)
+	visit = func(v interface{}, depth int, mediaCandidate bool) {
 		if depth > maxExtractDepth {
 			truncated = true
 			return
@@ -384,30 +431,50 @@ func extractVisibleStrings(raw json.RawMessage, budget *MediaTextBudget) Extract
 		}
 		switch val := v.(type) {
 		case string:
+			before := len(result)
+			card := val
 			if mediaCandidate {
 				result = appendVisibleMediaField(result, val, budget)
+				card = Null
+				if len(result) > before {
+					card = result[before]
+				}
 			} else {
 				result = append(result, val)
 			}
+			if len(result) > before {
+				positions = append(positions, len(atoms))
+			}
+			atoms = append(atoms, extract.DLPAtom{Text: val, Card: card})
+		case json.Number:
+			atoms = append(atoms, extract.DLPAtom{Text: val.String(), Card: jsonnumber.IntegralView(val), Number: true})
+		case bool:
+			card := "false"
+			if val {
+				card = "true"
+			}
+			atoms = append(atoms, extract.DLPAtom{Text: card, Card: card})
+		case nil:
+			atoms = append(atoms, extract.DLPAtom{Text: Null, Card: Null})
 		case []interface{}:
 			// An array under a media key is a list of payloads; each element
 			// decides for itself by shape.
 			for _, item := range val {
-				extract(item, depth+1, mediaCandidate)
+				visit(item, depth+1, mediaCandidate)
 			}
 		case map[string]interface{}:
 			// Keys inside a nested object decide for themselves; a parent key
 			// never makes a whole object opaque.
 			for _, key := range SortedKeys(val) {
-				extract(val[key], depth+1, isOpaqueMCPMediaField(key))
+				visit(val[key], depth+1, isOpaqueMCPMediaField(key))
 			}
 		}
 	}
-	extract(parsed, 0, false)
+	visit(parsed, 0, false)
 	if reason := budget.Reason(); reason != "" {
 		return ExtractStringsResult{Truncated: truncated, IncompleteReason: reason}
 	}
-	return ExtractStringsResult{Strings: result, Truncated: truncated}
+	return ExtractStringsResult{Strings: result, CardAtoms: atoms, StringPositions: positions, Truncated: truncated}
 }
 
 // isOpaqueMCPMediaField reports whether a structuredContent key conventionally
@@ -695,7 +762,7 @@ func decodeMediaPayload(payload string) ([]byte, bool) {
 // depth cap without returning any extracted strings.
 func jsonDepthTruncated(raw json.RawMessage) bool {
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
 		return false
 	}
 	return valueDepthTruncated(parsed, 0)
@@ -768,7 +835,7 @@ func ExtractStringsForKeys(raw json.RawMessage, keyPattern *regexp.Regexp) []str
 // keys and reports whether recursive extraction hit the depth cap.
 func ExtractStringsForKeysResult(raw json.RawMessage, keyPattern *regexp.Regexp) ExtractStringsResult {
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
 		return ExtractStringsResult{}
 	}
 	m, ok := parsed.(map[string]interface{})
@@ -818,31 +885,47 @@ func ExtractStringsFromJSON(raw json.RawMessage) []string {
 // arbitrary JSON and reports whether extraction hit the nesting cap.
 func ExtractStringsFromJSONResult(raw json.RawMessage) ExtractStringsResult {
 	var result []string
+	var atoms []extract.DLPAtom
+	var positions []int
 	truncated := false
-	var extract func(v interface{}, depth int)
-	extract = func(v interface{}, depth int) {
+	var visit func(v interface{}, depth int)
+	visit = func(v interface{}, depth int) {
 		if depth > maxExtractDepth {
 			truncated = true
 			return
 		}
 		switch val := v.(type) {
 		case string:
+			positions = append(positions, len(atoms))
 			result = append(result, val)
+			atoms = append(atoms, extract.DLPAtom{Text: val, Card: val})
+		case json.Number:
+			atoms = append(atoms, extract.DLPAtom{Text: val.String(), Card: jsonnumber.IntegralView(val), Number: true})
+		case bool:
+			value := "false"
+			if val {
+				value = "true"
+			}
+			atoms = append(atoms, extract.DLPAtom{Text: value, Card: value})
+		case nil:
+			atoms = append(atoms, extract.DLPAtom{Text: Null, Card: Null})
 		case []interface{}:
 			for _, item := range val {
-				extract(item, depth+1)
+				visit(item, depth+1)
 			}
 		case map[string]interface{}:
 			for _, k := range SortedKeys(val) {
-				extract(val[k], depth+1)
+				visit(val[k], depth+1)
 			}
 		}
 	}
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err == nil {
-		extract(parsed, 0)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err == nil && json.Valid(raw) {
+		visit(parsed, 0)
 	}
-	return ExtractStringsResult{Strings: result, Truncated: truncated}
+	return ExtractStringsResult{Strings: result, CardAtoms: atoms, StringPositions: positions, Truncated: truncated}
 }
 
 // ExtractKeysFromJSONResult recursively extracts JSON object keys and reports
@@ -893,7 +976,9 @@ func ExtractKeysFromJSONResult(raw json.RawMessage) ExtractKeysResult {
 		}
 	}
 	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err == nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err == nil && json.Valid(raw) {
 		extract(parsed, 0)
 	}
 	return ExtractKeysResult{Keys: result, Truncated: truncated}
