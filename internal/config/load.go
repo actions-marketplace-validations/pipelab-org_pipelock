@@ -76,25 +76,37 @@ func LoadForInspection(path string) (*Config, error) {
 	return load(path, loadOptions{resolveLicense: false, skipValidate: true})
 }
 
+// LoadReload reads the source once and returns its raw-byte hash even when
+// parsing or validation rejects it. Paths and environment remain daemon-owned.
+func LoadReload(path string) (*Config, string, error) {
+	return loadWithSourceHash(path, loadOptions{resolveLicense: true})
+}
+
 func load(path string, opts loadOptions) (*Config, error) {
+	cfg, _, err := loadWithSourceHash(path, opts)
+	return cfg, err
+}
+
+func loadWithSourceHash(path string, opts loadOptions) (*Config, string, error) {
 	var data []byte
 	var err error
 	if path == "-" {
 		data, err = io.ReadAll(os.Stdin)
 		if err != nil {
-			return nil, fmt.Errorf("reading config from stdin: %w", err)
+			return nil, "", fmt.Errorf("reading config from stdin: %w", err)
 		}
 	} else {
 		data, err = readStableRegularFile(filepath.Clean(path))
 		if err != nil {
-			return nil, fmt.Errorf("reading config %s: %w", path, err)
+			return nil, "", fmt.Errorf("reading config %s: %w", path, err)
 		}
 	}
 	configDir := "."
 	if path != "-" {
 		configDir = filepath.Dir(path)
 	}
-	return loadBytes(data, path, configDir, opts)
+	cfg, err := loadBytes(data, path, configDir, opts)
+	return cfg, policyHashOrigin.Sum(data).String(), err
 }
 
 func loadBytes(data []byte, sourceName, configDir string, opts loadOptions) (*Config, error) {
@@ -141,6 +153,13 @@ func loadBytes(data []byte, sourceName, configDir string, opts loadOptions) (*Co
 	// Detect omitted security booleans via raw YAML introspection and
 	// default them to true (fail-closed). Must run before ApplyDefaults().
 	applySecurityDefaults(data, cfg)
+	sourceLabel := sourceName
+	if sourceName == "-" {
+		sourceLabel = "stdin (no config file)"
+	}
+	for i := range cfg.mcpCompatibilityWarnings {
+		cfg.mcpCompatibilityWarnings[i].Message = fmt.Sprintf("config %q: %s", sourceLabel, cfg.mcpCompatibilityWarnings[i].Message)
+	}
 
 	cfg.ApplyDefaults()
 
