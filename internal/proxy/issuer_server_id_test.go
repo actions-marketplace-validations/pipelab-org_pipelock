@@ -4,8 +4,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
 )
 
 // Synthetic IDs in the shape mail and directory APIs return: long, mixed
@@ -28,6 +32,39 @@ const (
 	// agentBlob is the value an agent smuggles: ID-shaped, high entropy.
 	agentBlob = "Kd93JqWm2Xv7RbLp4TzNy8HsQf6GcUaE1Vo5Mi"
 )
+
+func TestIssuerIDBlockObservation(t *testing.T) {
+	var logs bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
+	p := &Proxy{metrics: metrics.New(), logger: logger}
+	s := p.newObservedIssuerQueryStore()
+	origin, _ := url.Parse("https://api.vendor.example/items")
+	s.taintSentLocked("first")
+	s.taintSentLocked("first")
+	s.taintSentLocked("second")
+	response := httptest.NewRecorder()
+	p.metrics.PrometheusHandler().ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	if !strings.Contains(response.Body.String(), `pipelock_issuer_id_blocks_total{scope="session"} 2`) {
+		t.Fatal("session transition metric missing")
+	}
+	if strings.Count(logs.String(), "anomaly detected") != 1 || strings.Contains(logs.String(), origin.Host) || strings.Contains(logs.String(), "first") {
+		t.Fatalf("expected one coalesced warning without identities or hosts, got %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "restart or disable and re-enable") {
+		t.Fatal("warning omitted recovery guidance")
+	}
+	fresh := p.newObservedIssuerQueryStore()
+	fresh.recordSent("first", origin, nil, nil, true, time.Now())
+	if fresh.mintBlockedLocked("first", origin) || fresh.idBlockReported {
+		t.Fatal("fresh store retained uncertainty or log coalescing")
+	}
+	plain := (&Proxy{}).newObservedIssuerQueryStore()
+	plain.taintSentLocked("first")
+}
 
 func (h *webPlatformHarness) send(upstream *httptest.Server, method, path, agent, contentType, body string) int {
 	h.t.Helper()
@@ -319,6 +356,53 @@ func newTestServerIDStore(t *testing.T) *issuerQueryStore {
 	return s
 }
 
+func TestIssuerServerIDHistoryRequired(t *testing.T) {
+	origin := mustIssuerQueryURL(t, "https://api.vendor.example/items")
+	now := time.Now()
+	t.Run("mint requires recorded send", func(t *testing.T) {
+		s := newTestServerIDStore(t)
+		s.mintServerID("owner", origin, serverIDListed, now)
+		if len(s.ids) != 0 || len(s.sent) != 0 {
+			t.Fatal("missing send history created ID authority or a history bucket")
+		}
+		s.recordSent("owner", origin, nil, nil, true, now)
+		s.mintServerID("owner", origin, serverIDListed, now)
+		if !s.serverIDIssued("owner", origin, serverIDListed) {
+			t.Fatal("recorded complete request did not permit response ID")
+		}
+	})
+	t.Run("lookup cannot consume history capacity", func(t *testing.T) {
+		s := newTestServerIDStore(t)
+		observations := 0
+		s.observeIDBlock = func(string, bool) { observations++ }
+		for i := 0; i <= issuerUnreadableMaxSessions; i++ {
+			if s.serverIDIssued(fmt.Sprintf("lookup-%d", i), origin, serverIDListed) {
+				t.Fatal("lookup admitted an unissued ID")
+			}
+		}
+		if len(s.sent) != 0 || len(s.sentUnreadable) != 0 || s.idCapacityReported || observations != 0 {
+			t.Fatal("read-only lookups changed history or capacity observations")
+		}
+		s.recordSent("peer", origin, nil, nil, true, now)
+		s.mintServerID("peer", origin, serverIDListed, now)
+		if !s.serverIDIssued("peer", origin, serverIDListed) {
+			t.Fatal("lookups prevented a later real caller from learning an ID")
+		}
+	})
+	t.Run("orphaned IDs cannot restore history", func(t *testing.T) {
+		s := newTestServerIDStore(t)
+		s.recordSent("owner", origin, nil, nil, true, now)
+		s.mintServerID("owner", origin, serverIDListed, now)
+		if !s.serverIDIssued("owner", origin, serverIDListed) {
+			t.Fatal("positive control: recorded response ID unavailable")
+		}
+		delete(s.sent, "owner")
+		if s.serverIDIssued("owner", origin, serverIDListed) || len(s.sent) != 0 {
+			t.Fatal("orphaned ID restored missing history")
+		}
+	})
+}
+
 func TestIssuerServerIDStore(t *testing.T) {
 	origin, _ := url.Parse("https://api.vendor.example/v1/filters")
 	now := time.Now()
@@ -334,6 +418,7 @@ func TestIssuerServerIDStore(t *testing.T) {
 
 	t.Run("an unread body revokes ids minted before it", func(t *testing.T) {
 		s := newTestServerIDStore(t)
+		s.recordSent("a", origin, nil, nil, true, now)
 		s.mintServerID("a", origin, serverIDListed, now)
 		if !s.serverIDIssued("a", origin, serverIDListed) {
 			t.Fatal("positive control: id not minted")
@@ -380,21 +465,6 @@ func TestIssuerServerIDStore(t *testing.T) {
 		}
 	})
 
-	t.Run("an evicted session does not mint on return", func(t *testing.T) {
-		s := newTestServerIDStore(t)
-		s.recordSent("a", origin, nil, []byte(agentBlob), true, now)
-		for i := 0; i < issuerCookieMaxSessions; i++ {
-			s.recordSent("filler-"+strings.Repeat("x", i+1), origin, nil, nil, true, now.Add(time.Duration(i+1)*time.Second))
-		}
-		if _, still := s.used["a"]; still {
-			t.Fatal("positive control: session a was not evicted")
-		}
-		s.mintServerID("a", origin, agentBlob, now)
-		if s.serverIDIssued("a", origin, agentBlob) {
-			t.Fatal("an evicted session minted a value it had sent")
-		}
-	})
-
 	t.Run("one malformed escape does not hide the rest of a form body", func(t *testing.T) {
 		s := newTestServerIDStore(t)
 		s.recordSent("a", origin, nil, []byte("bad=%ZZ&payload="+agentBlob[:10]+"%2B"+agentBlob[10:]), true, now)
@@ -414,26 +484,39 @@ func TestIssuerServerIDStore(t *testing.T) {
 		}
 	})
 
-	t.Run("a full tombstone set stops all minting", func(t *testing.T) {
+	t.Run("bucket capacity refuses newcomers without revoking peers", func(t *testing.T) {
 		s := newTestServerIDStore(t)
-		s.mu.Lock()
-		for i := 0; i < issuerUnreadableMaxSessions; i++ {
-			s.taintSentLocked("t" + strings.Repeat("y", i+1))
+		s.recordSent("existing", origin, nil, nil, true, now)
+		s.mintServerID("existing", origin, serverIDListed, now)
+		for i := 1; i < issuerUnreadableMaxSessions; i++ {
+			s.taintSentLocked(fmt.Sprintf("tainted-%d", i))
 		}
+		var events []string
+		s.observeIDBlock = func(scope string, log bool) { events = append(events, fmt.Sprintf("%s:%t", scope, log)) }
 		s.taintSentLocked("one-more")
-		s.mu.Unlock()
-		s.mintServerID("fresh", origin, serverIDListed, now)
-		if s.serverIDIssued("fresh", origin, serverIDListed) {
-			t.Fatal("minted after the tombstone set overflowed")
+		s.mintServerID("newcomer", origin, serverIDOther, now)
+		if s.serverIDIssued("newcomer", origin, serverIDOther) || len(s.sent) != issuerUnreadableMaxSessions {
+			t.Fatal("new bucket admitted past capacity")
+		}
+		if !s.serverIDIssued("existing", origin, serverIDListed) {
+			t.Fatal("capacity revoked existing peer")
+		}
+		if len(events) != 1 || events[0] != "capacity:true" {
+			t.Fatalf("capacity events = %v", events)
 		}
 	})
 
-	t.Run("a value another session sent is not minted", func(t *testing.T) {
+	t.Run("send history is isolated across trusted sessions", func(t *testing.T) {
 		s := newTestServerIDStore(t)
 		s.recordSent("a", origin, nil, []byte(agentBlob), true, now)
+		s.mintServerID("a", origin, agentBlob, now)
+		if s.serverIDIssued("a", origin, agentBlob) {
+			t.Fatal("own reflection minted")
+		}
+		s.recordSent("b", origin, nil, nil, true, now)
 		s.mintServerID("b", origin, agentBlob, now)
-		if s.serverIDIssued("b", origin, agentBlob) {
-			t.Fatal("a value session a sent was minted for session b")
+		if !s.serverIDIssued("b", origin, agentBlob) {
+			t.Fatal("another caller's sends poisoned recipient")
 		}
 	})
 
@@ -449,19 +532,18 @@ func TestIssuerServerIDStore(t *testing.T) {
 		}
 	})
 
-	t.Run("a full cross-session set stops all minting", func(t *testing.T) {
+	t.Run("total history capacity taints only the adding caller", func(t *testing.T) {
 		s := newTestServerIDStore(t)
-		s.mu.Lock()
-		for i := 0; i < issuerSentAllMaxEntries; i++ {
-			var d [32]byte
-			d[0], d[1], d[2] = byte(i), byte(i>>8), byte(i>>16)
-			s.sentAll[d] = struct{}{}
-		}
-		s.mu.Unlock()
+		s.recordSent("peer", origin, nil, nil, true, now)
+		s.mintServerID("peer", origin, serverIDListed, now)
+		s.sentEntries = issuerSentAllMaxEntries
 		s.recordSent("a", origin, nil, []byte(serverIDOther), true, now)
 		s.mintServerID("a", origin, serverIDListed, now)
 		if s.serverIDIssued("a", origin, serverIDListed) {
-			t.Fatal("minted after the cross-session set overflowed")
+			t.Fatal("adding caller did not fail closed")
+		}
+		if !s.serverIDIssued("peer", origin, serverIDListed) {
+			t.Fatal("capacity revoked peer")
 		}
 	})
 
@@ -479,9 +561,21 @@ func TestIssuerServerIDStore(t *testing.T) {
 	t.Run("plain http origin is ignored", func(t *testing.T) {
 		s := newTestServerIDStore(t)
 		plain, _ := url.Parse("http://api.vendor.example/v1/filters")
-		s.mintServerID("a", plain, serverIDListed, now)
+		s.recordSent("a", origin, nil, nil, true, now)
+		s.mintServerID("a", origin, serverIDListed, now)
+		if !s.serverIDIssued("a", origin, serverIDListed) {
+			t.Fatal("positive control: HTTPS origin did not mint an ID")
+		}
+		issued := len(s.ids["a"])
+		s.mintServerID("a", plain, serverIDOther, now)
+		if len(s.ids["a"]) != issued {
+			t.Fatal("plain http changed issued ID evidence")
+		}
 		if s.serverIDIssued("a", plain, serverIDListed) {
 			t.Fatal("plain http minted an id")
+		}
+		if !s.serverIDIssued("a", origin, serverIDListed) {
+			t.Fatal("plain http revoked HTTPS evidence")
 		}
 	})
 }
@@ -537,11 +631,12 @@ func TestIssuerServerIDUnmediatedSends(t *testing.T) {
 		h := newWebPlatformHarness(t)
 		store := h.p.issuerStoreForUnmediatedSend()
 		session := sessionKeyFor(h.cfg, agent, "127.0.0.1", envelope.ActorAuthBound)
+		store.recordSent(session, origin, nil, nil, true, now)
 		store.mintServerID(session, origin, serverIDListed, now)
 		if !store.serverIDIssued(session, origin, serverIDListed) {
 			t.Fatal("positive control: id not minted")
 		}
-		h.p.taintIssuerSessionForStream(h.cfg, agent, "127.0.0.1", envelope.ActorAuthBound)
+		h.p.taintIssuerSessionForStream(h.cfg, agent, "127.0.0.1", envelope.ActorAuthBound, origin)
 		if store.serverIDIssued(session, origin, serverIDListed) {
 			t.Fatal("an id survived a websocket handshake")
 		}

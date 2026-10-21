@@ -32,6 +32,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
@@ -568,6 +569,133 @@ func waitForWarnContext(t *testing.T, hookCh <-chan scanner.DLPWarnContext, scop
 	case <-time.After(testWarnHookTimeout):
 		t.Fatalf("timed out waiting for DLP warn hook to capture %s context", scope)
 		return scanner.DLPWarnContext{}
+	}
+}
+
+func TestWSProxyIssuerHistoryUncertainty(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+	proxyAddr, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.TLSInterception.Enabled = true
+		cfg.DefaultAgentIdentity = "sender"
+		cfg.BindDefaultAgentIdentity = true
+	})
+	defer cleanup()
+	store := p.issuerStoreForUnmediatedSend()
+	if store == nil {
+		t.Fatal("issuer history store unavailable")
+	}
+	origin, err := url.Parse("https://" + backendAddr + "/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := sessionKeyFor(p.cfgPtr.Load(), edition.ConfigDefaultName("sender"), "127.0.0.1", envelope.ActorAuthConfigDefault)
+	peer := sessionKeyFor(p.cfgPtr.Load(), "peer", "127.0.0.1", envelope.ActorAuthBound)
+	for _, key := range []string{sender, peer} {
+		store.recordSent(key, origin, nil, nil, true, time.Now())
+		store.mintServerID(key, origin, serverIDListed, time.Now())
+		if !store.serverIDIssued(key, origin, serverIDListed) {
+			t.Fatal("positive control: caller did not learn the ID")
+		}
+	}
+	conn, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/"+agentBlob)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	var statusErr ws.StatusError
+	if !errors.As(err, &statusErr) || int(statusErr) != http.StatusForbidden {
+		t.Fatalf("unissued high-entropy WebSocket target error = %v, want HTTP 403", err)
+	}
+	if !store.serverIDIssued(sender, origin, serverIDListed) {
+		t.Fatal("a blocked WebSocket request tainted its caller")
+	}
+	conn = dialWS(t, proxyAddr, backendAddr)
+	defer func() { _ = conn.Close() }()
+	if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := wsutil.ReadServerData(conn); err != nil {
+		t.Fatal(err)
+	}
+	if store.serverIDIssued(sender, origin, serverIDListed) {
+		t.Fatal("sender kept an ID after its WebSocket traffic reached the host")
+	}
+	if !store.serverIDIssued(peer, origin, serverIDListed) {
+		t.Fatal("sender's WebSocket tainted another trusted caller")
+	}
+}
+
+func TestWSProxyIssuerHistoryTaintedBeforeHandshake(t *testing.T) {
+	proxyAddr, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.TLSInterception.Enabled = true
+		cfg.DefaultAgentIdentity = "sender"
+		cfg.BindDefaultAgentIdentity = true
+	})
+	defer cleanup()
+	store := p.issuerStoreForUnmediatedSend()
+	if store == nil {
+		t.Fatal("issuer history store unavailable")
+	}
+	sender := sessionKeyFor(p.cfgPtr.Load(), edition.ConfigDefaultName("sender"), "127.0.0.1", envelope.ActorAuthConfigDefault)
+	peer := sessionKeyFor(p.cfgPtr.Load(), "peer", "127.0.0.1", envelope.ActorAuthBound)
+	type evidence struct{ retained, minted, peerRetained bool }
+	observed := make(chan evidence, 1)
+	var origin *url.URL
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// This runs concurrently with the proxy at the first upstream HTTP
+		// request, before any upgrade response or WebSocket frame exists.
+		retained := store.serverIDIssued(sender, origin, serverIDListed)
+		store.mintServerID(sender, origin, serverIDOther, time.Now())
+		observed <- evidence{retained, store.serverIDIssued(sender, origin, serverIDOther), store.serverIDIssued(peer, origin, serverIDListed)}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	var err error
+	origin, err = url.Parse(strings.Replace(upstream.URL, "http://", "https://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{sender, peer} {
+		store.recordSent(key, origin, nil, nil, true, time.Now())
+		store.mintServerID(key, origin, serverIDListed, time.Now())
+		if !store.serverIDIssued(key, origin, serverIDListed) {
+			t.Fatal("positive control: caller did not learn the ID")
+		}
+	}
+	conn, err := dialWSConnToTarget(proxyAddr, strings.Replace(upstream.URL, "http://", "ws://", 1))
+	if err != nil {
+		t.Fatalf("client upgrade before upstream dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	handshakeTimeout := time.NewTimer(5 * time.Second)
+	defer handshakeTimeout.Stop()
+	select {
+	case got := <-observed:
+		if got.retained || got.minted || !got.peerRetained {
+			t.Fatalf("upstream handshake saw usable issuer evidence: %+v", got)
+		}
+	case <-handshakeTimeout.C:
+		t.Fatal("upstream handshake was not observed")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = wsutil.ReadServerData(conn)
+	var closed wsutil.ClosedError
+	// The upstream's 503 makes the dial fail after the handshake was sent.
+	// A close frame or EOF proves the client cannot keep using the stream.
+	if !errors.Is(err, io.EOF) && (!errors.As(err, &closed) || closed.Code != ws.StatusInternalServerError) {
+		t.Fatalf("failed upstream handshake = %v, want closed stream", err)
+	}
+	if store.serverIDIssued(sender, origin, serverIDListed) {
+		t.Fatal("failed upstream dial restored previously learned evidence")
+	}
+	store.mintServerID(sender, origin, serverIDOther, time.Now())
+	if store.serverIDIssued(sender, origin, serverIDOther) {
+		t.Fatal("failed upstream dial allowed new issuer evidence")
+	}
+	if !store.serverIDIssued(peer, origin, serverIDListed) {
+		t.Fatal("failed upstream dial tainted another trusted caller")
 	}
 }
 

@@ -45,6 +45,108 @@ func newSentIssuerProxy(t *testing.T) (*Proxy, *config.Config) {
 	return p, cfg
 }
 
+// No untrusted grade may read or mutate learned IDs, even when the default
+// state projection would place it in the same bucket as a configured agent.
+func TestIssuerSentIdentityIsolation(t *testing.T) {
+	for _, defaultName := range []string{"", "recipient"} {
+		for _, auth := range []envelope.ActorAuth{envelope.ActorAuthUnknown, envelope.ActorAuthSelfDeclared, envelope.ActorAuthMatched, envelope.ActorAuthBound, envelope.ActorAuthConfigDefault} {
+			for _, transport := range []string{"intercept", "forward", "fetch", "websocket"} {
+				t.Run(defaultName+"/"+string(auth)+"/"+transport, func(t *testing.T) {
+					p, cfg := newSentIssuerProxy(t)
+					cfg.DefaultAgentIdentity = defaultName
+					origin, _ := url.Parse("https://api.vendor.example/items")
+					s := p.issuerStoreForUnmediatedSend()
+					const agent = "recipient"
+					const client = "192.0.2.1"
+					trusted := sessionKeyFor(cfg, agent, client, envelope.ActorAuthBound)
+					s.recordSent(trusted, origin, nil, nil, true, time.Now())
+					s.mintServerID(trusted, origin, serverIDListed, time.Now())
+					if !s.serverIDIssued(trusted, origin, serverIDListed) {
+						t.Fatal("positive control missing")
+					}
+					req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, origin.String(), strings.NewReader(agentBlob))
+					req.Header.Set("X-Criteria", agentBlob)
+					ic := &InterceptContext{Proxy: p, Config: cfg, Agent: agent, ClientIP: client, ActorAuth: auth}
+					if got := ic.issuerServerIDStore() != nil; got != auth.TrustedForIdentity() {
+						t.Fatalf("accessor eligibility = %v", got)
+					}
+					switch transport {
+					case "intercept":
+						recordIssuerRequestSent(ic, req, nil)
+					case "forward":
+						p.recordIssuerForwardSent(cfg, agent, client, auth, req, nil)
+					case "fetch":
+						u := *origin
+						u.Path += "/" + agentBlob
+						p.recordIssuerFetchSent(cfg, agent, client, auth, &u)
+					case "websocket":
+						p.taintIssuerSessionForStream(cfg, agent, client, auth, origin)
+					}
+					if transport != "fetch" && s.serverIDIssued(trusted, origin, serverIDListed) == auth.TrustedForIdentity() {
+						t.Fatal("own taint or untrusted DoS isolation failed")
+					}
+					s.mintServerID(trusted, origin, agentBlob, time.Now())
+					if s.serverIDIssued(trusted, origin, agentBlob) == auth.TrustedForIdentity() {
+						t.Fatal("send history crossed trust boundary or own reflection minted")
+					}
+					peer := sessionKeyFor(cfg, "peer", client, envelope.ActorAuthBound)
+					s.recordSent(peer, origin, nil, nil, true, time.Now())
+					s.mintServerID(peer, origin, serverIDOther, time.Now())
+					if !s.serverIDIssued(peer, origin, serverIDOther) {
+						t.Fatal("taint crossed bound identities on shared IP")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestIssuerSentIncompleteCallerLocal(t *testing.T) {
+	origin, _ := url.Parse("https://api.vendor.example/items")
+	for _, cause := range []string{"unread body", "request limit", "session limit", "websocket"} {
+		t.Run(cause, func(t *testing.T) {
+			p, cfg := newSentIssuerProxy(t)
+			s := p.issuerStoreForUnmediatedSend()
+			sender := sessionKeyFor(cfg, "sender", "192.0.2.1", envelope.ActorAuthBound)
+			peer := sessionKeyFor(cfg, "peer", "192.0.2.1", envelope.ActorAuthBound)
+			for _, key := range []string{sender, peer} {
+				s.recordSent(key, origin, nil, nil, true, time.Now())
+				s.mintServerID(key, origin, serverIDListed, time.Now())
+			}
+			var body []byte
+			known := true
+			switch cause {
+			case "unread body":
+				known = false
+			case "request limit":
+				body = []byte(strings.Repeat(serverIDOther+" ", issuerSentMaxTokensPerRequest+1))
+			case "session limit":
+				for i := 0; i < issuerSentMaxEntries; i++ {
+					var digest [32]byte
+					digest[0], digest[1] = byte(i), byte(i>>8)
+					s.sent[sender][digest] = struct{}{}
+				}
+				body = []byte(agentBlob)
+			}
+			if cause == "websocket" {
+				p.taintIssuerSessionForStream(cfg, "sender", "192.0.2.1", envelope.ActorAuthBound, origin)
+			} else {
+				s.recordSent(sender, origin, nil, body, known, time.Now())
+			}
+			if s.serverIDIssued(sender, origin, serverIDListed) {
+				t.Fatal("own ID survived incomplete history")
+			}
+			s.mintServerID(sender, origin, serverIDOther, time.Now())
+			if s.serverIDIssued(sender, origin, serverIDOther) {
+				t.Fatal("own taint failed open on later listing")
+			}
+			if !s.serverIDIssued(peer, origin, serverIDListed) {
+				t.Fatal("peer lost allowance")
+			}
+		})
+	}
+}
+
 func TestIssuerSentJSONTextOutsideRawBody(t *testing.T) {
 	origin, err := url.Parse("https://api.vendor.example/v1/filters")
 	if err != nil {

@@ -71,14 +71,15 @@ type issuerQueryStore struct {
 	ids            map[string][][32]byte
 	sent           map[string]map[[32]byte]struct{}
 	sentUnreadable map[string]bool
-	// sentAll holds sent digests across every session, so one agent's value
-	// cannot mint as an ID for another.
-	sentAll map[[32]byte]struct{}
-	// mintDisabled stops all minting once incomplete sent history can no
-	// longer be remembered per session.
-	mintDisabled bool
-	used         map[string]time.Time
-	disabled     bool
+	// ID history is retained independently of query-evidence LRU eviction.
+	// Capacity denies new buckets or taints only the caller adding history;
+	// it never revokes an existing peer's IDs.
+	sentEntries        int
+	observeIDBlock     func(scope string, log bool)
+	idBlockReported    bool
+	idCapacityReported bool
+	used               map[string]time.Time
+	disabled           bool
 }
 
 func newIssuerQueryStore() *issuerQueryStore {
@@ -96,7 +97,6 @@ func newIssuerQueryStoreWithReader(reader io.Reader) *issuerQueryStore {
 		used:      make(map[string]time.Time),
 
 		sentUnreadable: make(map[string]bool),
-		sentAll:        make(map[[32]byte]struct{}),
 	}
 	if _, err := io.ReadFull(reader, s.key[:]); err != nil {
 		s.disabled = true
@@ -105,7 +105,25 @@ func newIssuerQueryStoreWithReader(reader io.Reader) *issuerQueryStore {
 }
 
 func (ic *InterceptContext) issuerQueryStore() *issuerQueryStore {
-	if ic == nil || ic.Proxy == nil || !issuerCookieEnabled(ic.Config) || !ic.stateTrusted() {
+	if ic == nil || !ic.stateTrusted() {
+		return nil
+	}
+	return ic.issuerEvidenceRuntimeStore()
+}
+
+// issuerServerIDStore admits only the request's resolved trusted grade.
+// stateIdentity's default projection is for detection state: a caller-supplied
+// header must not turn an untrusted grade into learned-ID authority.
+
+func (ic *InterceptContext) issuerServerIDStore() *issuerQueryStore {
+	if ic == nil || !ic.ActorAuth.TrustedForIdentity() {
+		return nil
+	}
+	return ic.issuerEvidenceRuntimeStore()
+}
+
+func (ic *InterceptContext) issuerEvidenceRuntimeStore() *issuerQueryStore {
+	if ic == nil || ic.Proxy == nil || !issuerCookieEnabled(ic.Config) {
 		return nil
 	}
 	runtime := ic.Proxy.issuerCookieRuntime.Load()
@@ -162,10 +180,9 @@ func (s *issuerQueryStore) admitSessionLocked(session string) {
 	delete(s.redirects, oldest)
 	delete(s.paths, oldest)
 	delete(s.documents, oldest)
-	// An evicted session's sent history is lost, so if it returns it must
-	// not mint as though it had sent nothing: the tombstone outlives eviction.
-	delete(s.sent, oldest)
-	s.taintSentLocked(oldest)
+	// ID history has its own bounded admission and must outlive query LRU
+	// eviction. Losing query evidence cannot erase reflection history or
+	// revoke another caller's IDs.
 	delete(s.used, oldest)
 }
 
@@ -523,7 +540,8 @@ func recordDeliveredIssuerQuery(ic *InterceptContext, response *http.Response, b
 		return
 	}
 	store := ic.issuerQueryStore()
-	if store == nil {
+	idStore := ic.issuerServerIDStore()
+	if store == nil && idStore == nil {
 		return
 	}
 	issuerHost, issuerPort, ok := issuerCookieOrigin(response.Request.URL)
@@ -534,7 +552,7 @@ func recordDeliveredIssuerQuery(ic *InterceptContext, response *http.Response, b
 	// An OAuth authorization request names where the code must go. Record the
 	// declaration only once the request was allowed and its response
 	// delivered, which is the only way this function is reached.
-	if redirect, declared := oauthRedirectDeclaration(response.Request.URL); declared {
+	if redirect, declared := oauthRedirectDeclaration(response.Request.URL); declared && store != nil {
 		store.declareRedirect(session, response.Request.URL, redirect, time.Now())
 	}
 	remaining := issuerCookieMaxSetCookies
@@ -552,6 +570,9 @@ func recordDeliveredIssuerQuery(ic *InterceptContext, response *http.Response, b
 	// has a scheme or starts with a single slash; otherwise any word the
 	// server returned would resolve to a path it never issued.
 	observe := func(value string, redirectHop, linkAttr bool) {
+		if store == nil {
+			return
+		}
 		candidate, err := url.Parse(value)
 		if err != nil {
 			return
@@ -618,6 +639,9 @@ func recordDeliveredIssuerQuery(ic *InterceptContext, response *http.Response, b
 	}
 	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0]))
 	if mediaType == "text/html" || mediaType == "application/xhtml+xml" {
+		if store == nil {
+			return
+		}
 		// The agent received a document from this origin, so a later request
 		// may name it as the page it is embedded in.
 		store.rememberDocument(session, response.Request.URL, time.Now())
@@ -692,7 +716,7 @@ func recordDeliveredIssuerQuery(ic *InterceptContext, response *http.Response, b
 			}
 			observe(t, false, false)
 			if idRemaining > 0 && issuerServerIDShaped(t) {
-				store.mintServerID(session, response.Request.URL, t, time.Now())
+				idStore.mintServerID(session, response.Request.URL, t, time.Now())
 				idRemaining--
 			}
 			valueDone()
