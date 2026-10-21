@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -258,7 +259,7 @@ func TestGoogleOAuthAudience_AuthorizationOnly(t *testing.T) {
 	} {
 		t.Run("WebSocket "+tc.name, func(t *testing.T) {
 			p := &Proxy{metrics: metrics.New(), logger: audit.NewNop()}
-			blocked, _, _, _, _ := p.dlpScanWSHeaders(t.Context(), http.Header{tc.header: []string{tc.value}}, sc, cfg, wsTarget, audit.LogContext{})
+			blocked, _, _, _, _, _ := p.dlpScanWSHeaders(t.Context(), http.Header{tc.header: []string{tc.value}}, sc, cfg, wsTarget, audit.LogContext{})
 			if blocked != tc.block {
 				t.Fatalf("WebSocket header %q blocked=%t want %t", tc.header, blocked, tc.block)
 			}
@@ -1108,6 +1109,13 @@ func TestInterceptTunnel_CredentialOutsideAudienceStillBlocks(t *testing.T) {
 
 	if resp.StatusCode == http.StatusOK {
 		t.Fatal("credential sent outside its declared audience over CONNECT was allowed")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "credential audience mismatch") || !strings.Contains(string(body), "127.0.0.1") || strings.Contains(string(body), "Bearer tstaud-") {
+		t.Fatalf("intercepted header explanation = %s", body)
 	}
 }
 

@@ -314,9 +314,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// can carry Proxy-Authorization, Authorization, or custom headers that
 	// may contain secrets. Tunneled HTTP headers are only visible with TLS
 	// interception; this covers the handshake itself.
-	connectHeaderBlocked, connectHeaderHadFinding, connectHeaderReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
+	connectHeaderBlocked, connectHeaderHadFinding, connectHeaderReason, connectHeaderReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
 		headers: r.Header, cfg: cfg, sc: sc, logger: p.logger, actx: headerCtx,
 		hostname: host, target: syntheticURL, metricAgent: agentLabel, start: start,
+		reasonPrefix: "CONNECT blocked: header DLP match",
 	})
 	if connectHeaderReceiptErr != nil {
 		blockedErr := newCredentialAudienceReceiptBlockedRequest(connectHeaderReceiptErr)
@@ -380,7 +381,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.metrics.RecordTunnelBlocked(agentLabel)
 		writeBlockedError(w,
 			blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP).WithRequestID(requestID),
-			"CONNECT blocked: header DLP match", http.StatusForbidden)
+			connectHeaderReason, http.StatusForbidden)
 		return
 	}
 
@@ -1659,6 +1660,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					reason = bodyEntropyReason(bodyResult)
 				}
 			}
+			receiptPattern := reason
+			reason = bodyResult.withAudienceExplanation(reason)
 			promptInjectionHardBlock := shouldHardBlockBodyPromptInjection(bodyResult, r.URL.Hostname(), cfg)
 			bodyAdaptiveExempt := isBodyAdaptiveExempt(scannerLabel, bodyResult, r.URL.Hostname(), cfg)
 			// Classify the block by its cause after the exemption decision,
@@ -1675,7 +1678,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			// A request can trigger both DLP and address findings simultaneously.
 			if len(bodyResult.DLPMatches) > 0 {
 				p.metrics.RecordBodyDLP(action, agentLabel)
-				p.logger.LogBodyDLP(actx, action, len(bodyResult.DLPMatches), patternNames, bundleRules)
+				p.logger.LogBodyDLP(actx, action, len(bodyResult.DLPMatches), patternNames, bundleRules, bodyResult.CredentialAudienceMismatches...)
 			}
 			if len(bodyResult.AddressFindings) > 0 {
 				for _, f := range bodyResult.AddressFindings {
@@ -1708,7 +1711,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					ActionID:            actionID,
 					Verdict:             config.ActionBlock,
 					Layer:               scannerLabel,
-					Pattern:             reason,
+					Pattern:             receiptPattern,
 					Transport:           "forward",
 					Method:              r.Method,
 					Target:              targetURL,
@@ -1749,7 +1752,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					ActionID:            actionID,
 					Verdict:             config.ActionBlock,
 					Layer:               scannerLabel,
-					Pattern:             reason,
+					Pattern:             receiptPattern,
 					Transport:           "forward",
 					Method:              r.Method,
 					Target:              targetURL,
@@ -1778,7 +1781,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					ActionID:            actionID,
 					Verdict:             config.ActionBlock,
 					Layer:               scannerLabel,
-					Pattern:             reason + " (escalated)",
+					Pattern:             receiptPattern + " (escalated)",
 					Transport:           "forward",
 					Method:              r.Method,
 					Target:              targetURL,
@@ -1804,7 +1807,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			if action == config.ActionWarn {
 				forwardReceiptVerdict = config.ActionWarn
 				forwardReceiptLayer = scannerLabel
-				forwardReceiptPattern = reason
+				forwardReceiptPattern = receiptPattern
 			}
 		}
 
@@ -1830,7 +1833,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Request header DLP scanning.
 	// hadFinding is true even in audit/warn mode so near-miss signals are recorded.
-	forwardHeaderBlocked, forwardHeaderHadFinding, forwardHeaderReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
+	forwardHeaderBlocked, forwardHeaderHadFinding, forwardHeaderReason, forwardHeaderReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
 		headers: r.Header, cfg: cfg, sc: sc, logger: p.logger, actx: actx,
 		hostname: r.URL.Hostname(), target: targetURL, metricAgent: agentLabel, start: start,
 	})
@@ -1909,7 +1912,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		}))
 		writeBlockedError(w,
 			blockInfoFor(blockreason.DLPMatch, "header_dlp").WithRequestID(requestID),
-			"blocked: request header contains secret", http.StatusForbidden)
+			"blocked: "+forwardHeaderReason, http.StatusForbidden)
 		return
 	}
 
@@ -2217,7 +2220,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
 				Layer:               blockedErr.layer,
-				Pattern:             blockedErr.reason,
+				Pattern:             blockedErr.decisivePattern(),
 				Transport:           "forward",
 				Method:              r.Method,
 				Target:              targetURL,
@@ -2336,7 +2339,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
 				Layer:               blockedErr.layer,
-				Pattern:             blockedErr.reason,
+				Pattern:             blockedErr.decisivePattern(),
 				Transport:           "forward",
 				Method:              r.Method,
 				Target:              redirectReceiptTarget(blockedErr, targetURL),

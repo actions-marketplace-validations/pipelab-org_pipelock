@@ -66,6 +66,12 @@ suppress:
 | Basename glob | `*.generated.go` | `pkg/api/types.generated.go` |
 | URL suffix | `robots.txt` | `https://example.com/robots.txt` |
 
+A complete URL without glob characters matches that URL, with standard-port normalization. To match a URL prefix, end the entry with `/` or use an explicit wildcard. Scheme-qualified entries aren't URL path suffixes; the suffix form uses a path tail such as `robots.txt`.
+
+The characters `*`, `?`, and `[` introduce glob matching, including in query strings. Write `[?]` for a literal `?` and `[[]` for a literal `[`: for example, `https://api.vendor.example/token[?]mode=refresh` matches `https://api.vendor.example/token?mode=refresh`. Backslashes are normalized to `/`, so they can't escape glob characters. Globs first use Go's [`path.Match`](https://pkg.go.dev/path#Match), where `*` stops at `/`. URL patterns also have a fallback where `*` crosses `/`, but the pieces between stars are literal: that fallback doesn't interpret `?` or character classes such as `[?]`. When a query-specific entry needs to cover several path segments, list each complete URL with `[?]` instead of combining a separator-crossing `*` with a character class.
+
+**Upgrade note:** Review URL suppress entries that previously matched more than the written URL. Those additional findings are no longer suppressed by a literal entry. For an intentional prefix, use a trailing `/` or an explicit `*` after checking the resulting scope. Plain path tails such as `robots.txt` retain suffix matching.
+
 The `reason` field is optional but recommended. It appears in audit logs and helps future maintainers understand why the suppression exists.
 
 **When to use:** Directories with known false positives, third-party code, generated files, documentation directories.
@@ -90,6 +96,31 @@ suppress:
 ```
 
 Use both knobs. `exempt_domains` keeps URL DLP from blocking a provider-bound key on the provider's own host. `suppress` silences the same rule for request bodies and headers on the provider endpoint. The key still blocks when it is sent anywhere else.
+
+### An exact token route
+
+A body or header block can report a credential audience mismatch: the matched rule has a declared audience, and the request's canonical destination is outside it. The diagnostic names the pattern, scanned surface, destination host and built-in audience hosts, without including the credential. An absent mismatch explanation does not mean a request is safe; a carrier restriction, core rule or incomplete scan can still block it. `pipelock explain` evaluates URL scanning, not request bodies or headers.
+
+Audience diagnostics show the canonical destination and public built-in audience hosts; they omit operator-declared audience hosts. A diagnostic marked `immutable core rule` cannot be cleared with `suppress`. Core protection still applies even if a configurable rule has the same name.
+
+For GitHub Enterprise or a self-managed GitLab instance, review [`dlp.github_enterprise_hosts` or `dlp.gitlab_hosts`](../configuration.md#per-pattern-domain-exemptions). These lists trust exact hosts with credentials on eligible headers only; declare only instances your organization operates. They don't clear body or URL findings or remove carrier restrictions.
+
+If investigation confirms a legitimate token exchange, an operator can suppress the specific non-core rule at an exact URL. Replace the neutral example URL with the verified endpoint and use the rule name from the diagnostic:
+
+```yaml
+suppress:
+  - rule: Anthropic API Key
+    path: https://api.vendor.example/v1/oauth/token
+    reason: Operator-approved token route
+```
+
+This applies to that rule in request bodies and scanned headers at the route for forwarded, TLS-intercepted and reverse-proxy requests. It cannot suppress a CONNECT outer-header finding: that scan uses the tunnel authority URL, which has no inner request path. It is route-wide: the matching credential shape is suppressed in any body field or scanned header, not just a `refresh_token` field. Other DLP rules and core protections still apply. URL DLP does not consult `suppress`, so putting the credential in the URL query still blocks.
+
+Reverse-proxy URL text scanning also does not consult per-pattern `exempt_domains`. Remove credentials from the request URL rather than applying body or header remedies to that finding.
+
+The exact entry does not cover another route, a query-bearing target, a lookalike host or port 8443. Explicit port 443 and an omitted HTTPS port are equivalent. A trailing slash makes the entry a prefix, and a glob broadens it, including across slashes and query strings; keep the complete exact URL when that is the intended scope. Test the normal request and these negative cases before applying the entry. Keep its reason and remove it when it is no longer needed.
+
+This does not add a refresh-token allowance or change the built-in audience. Avoid using `passthrough_domains` for this remedy: TLS passthrough removes inspection of inner requests and responses, far beyond one pattern at one route.
 
 ## Layer 3: `--exclude` Flag
 

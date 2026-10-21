@@ -1089,13 +1089,18 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			requestEffectiveAction = strongestRequestAction(requestEffectiveAction, action)
 			requestScannerVerdict = scannerVerdictForContinuingAction(requestEffectiveAction, cfg.EnforceEnabled())
 			patternNames := dlpMatchNames(pathDLP.Matches)
-			rp.logger.LogBodyDLP(newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: ""}),
+			mismatches := scanner.TextDLPCredentialAudienceMismatches(pathDLP.Matches, targetURL, "url")
+			rp.logger.LogReverseURLDLP(newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: ""}),
 				action,
-				len(patternNames), patternNames, nil)
+				len(patternNames), patternNames, nil, mismatches...)
 
 			if enforcedBlock(cfg, action, containsCoreFloorMatch(pathDLP.Matches)) {
 				reason := fmt.Sprintf("URL DLP: %s", strings.Join(patternNames, ", "))
-				rp.recordRequestBlockSignal(r, agent, clientIP, requestID, resolvedIdentity.Auth, cfg, scanner.ScannerDLP, reason)
+				receiptPattern := reason
+				if explanation := scanner.CredentialAudienceMismatchExplanation(mismatches); explanation != "" {
+					reason += "; " + explanation
+				}
+				rp.recordRequestBlockSignal(r, agent, clientIP, requestID, resolvedIdentity.Auth, cfg, scanner.ScannerDLP, receiptPattern)
 				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
 				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "url_dlp")
 				// Sign the denial so every reverse DLP block leaves a receipt,
@@ -1108,7 +1113,7 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 					ActionID:  receipt.NewActionID(),
 					Verdict:   config.ActionBlock,
 					Layer:     scanner.ScannerDLP,
-					Pattern:   reason,
+					Pattern:   receiptPattern,
 					Transport: TransportReverse,
 					Method:    r.Method,
 					Target:    targetURL,
@@ -1126,20 +1131,15 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	// Scan request headers for DLP patterns (secret exfiltration via headers).
 	if cfg.RequestBodyScanning.Enabled && cfg.RequestBodyScanning.ScanHeaders {
-		// Pass the full upstream destination (scheme://host[:port]/path) so
-		// destination-scoped suppress globs (e.g. "https://api.example.com/*")
-		// resolve against the URL the request will actually reach, not the
-		// path-only r.URL.String() the reverse proxy sees from the client.
-		dlpTarget := *rp.upstream
-		dlpTarget.Path = joinReversePaths(rp.upstream.Path, r.URL.Path)
-		dlpTarget.RawPath = ""
-		headerResult := scanRequestHeadersForTargetWithAudience(r.Context(), r.Header, cfg, sc, dlpTarget.String(), func(match scanner.TextDLPMatch, reason string) {
+		// Use the same complete upstream destination as body DLP, including
+		// configured and incoming query parameters.
+		headerResult := scanRequestHeadersForTargetWithAudience(r.Context(), r.Header, cfg, sc, targetURL, func(match scanner.TextDLPMatch, reason string) {
 			if rp.logger != nil {
 				rp.logger.LogDLPDropped(newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: agent}), match.PatternName, match.Severity, "header", reason)
 			}
 			rp.metrics.RecordDLPDroppedMatch(match.PatternName, "header", reason)
 		}, func(allow scanner.CredentialAudienceAllow) error {
-			return rp.recordCredentialAudienceAllow(cfg, newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: agent}), allow, r.Method, dlpTarget.String(), requestID, agent, receiptShardFromContext(r.Context()))
+			return rp.recordCredentialAudienceAllow(cfg, newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: agent}), allow, r.Method, targetURL, requestID, agent, receiptShardFromContext(r.Context()))
 		})
 		if headerResult != nil && headerResult.CredentialAudienceReceiptErr != nil {
 			blockedErr := newCredentialAudienceReceiptBlockedRequest(headerResult.CredentialAudienceReceiptErr)
@@ -1160,11 +1160,12 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			requestScannerVerdict = scannerVerdictForContinuingAction(requestEffectiveAction, cfg.EnforceEnabled())
 			patternNames := dlpMatchNames(headerResult.DLPMatches)
 			rp.logger.LogHeaderDLP(newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: ""}), headerResult.HeaderName,
-				action, patternNames, nil)
+				action, patternNames, nil, headerResult.CredentialAudienceMismatches...)
 
 			if headerHardBlock || (action == config.ActionBlock && cfg.EnforceEnabled()) {
-				reason := fmt.Sprintf("header DLP: %s", strings.Join(patternNames, ", "))
-				rp.recordRequestBlockSignal(r, agent, clientIP, requestID, resolvedIdentity.Auth, cfg, scanner.ScannerDLP, reason)
+				receiptPattern := fmt.Sprintf("header DLP: %s", strings.Join(patternNames, ", "))
+				reason := headerResult.withAudienceExplanation(receiptPattern)
+				rp.recordRequestBlockSignal(r, agent, clientIP, requestID, resolvedIdentity.Auth, cfg, scanner.ScannerDLP, receiptPattern)
 				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
 				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "header_dlp")
 				// Sign the denial under the cross-transport header-DLP layer
@@ -1175,7 +1176,7 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 					ActionID:  receipt.NewActionID(),
 					Verdict:   config.ActionBlock,
 					Layer:     "dlp_header",
-					Pattern:   reason,
+					Pattern:   receiptPattern,
 					Transport: TransportReverse,
 					Method:    r.Method,
 					Target:    targetURL,
@@ -2108,6 +2109,8 @@ func (rp *ReverseProxyHandler) scanRequest(w http.ResponseWriter, r *http.Reques
 	if reason == "" {
 		reason = "request body contains secret patterns"
 	}
+	receiptPattern := reason
+	reason = result.withAudienceExplanation(reason)
 	clientIP, _ := r.Context().Value(ctxKeyClientIP).(string)
 	requestID, _ := r.Context().Value(ctxKeyRequestID).(string)
 	actx := newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: ""})
@@ -2116,7 +2119,7 @@ func (rp *ReverseProxyHandler) scanRequest(w http.ResponseWriter, r *http.Reques
 	}
 	recordBodyRedactionMetrics(rp.metrics, "reverse", "", result.RedactionReport)
 	if len(patternNames) > 0 {
-		rp.logger.LogBodyDLP(actx, action, len(patternNames), patternNames, nil)
+		rp.logger.LogBodyDLP(actx, action, len(patternNames), patternNames, nil, result.CredentialAudienceMismatches...)
 	}
 	if result.EntropyFinding != nil {
 		rp.metrics.RecordBodyEntropy(action, "")
@@ -2166,14 +2169,14 @@ func (rp *ReverseProxyHandler) scanRequest(w http.ResponseWriter, r *http.Reques
 			ActionID:  receipt.NewActionID(),
 			Verdict:   config.ActionBlock,
 			Layer:     layer,
-			Pattern:   reason,
+			Pattern:   receiptPattern,
 			Transport: TransportReverse,
 			Method:    r.Method,
 			Target:    receiptInput.Target,
 			RequestID: receiptInput.RequestID,
 			Agent:     receiptInput.Agent,
 		})
-		rp.recordBodyBlockSignal(r, cfg, result, receiptInput, clientIP, requestID, signalScanner, reason)
+		rp.recordBodyBlockSignal(r, cfg, result, receiptInput, clientIP, requestID, signalScanner, receiptPattern)
 		writeReverseProxyBlock(w, http.StatusForbidden,
 			blockInfoFor(bodyBlockReason, layer).WithRequestID(requestID),
 			reason)
@@ -2187,14 +2190,14 @@ func (rp *ReverseProxyHandler) scanRequest(w http.ResponseWriter, r *http.Reques
 			ActionID:  receipt.NewActionID(),
 			Verdict:   config.ActionBlock,
 			Layer:     layer,
-			Pattern:   reason,
+			Pattern:   receiptPattern,
 			Transport: TransportReverse,
 			Method:    r.Method,
 			Target:    receiptInput.Target,
 			RequestID: receiptInput.RequestID,
 			Agent:     receiptInput.Agent,
 		})
-		rp.recordBodyBlockSignal(r, cfg, result, receiptInput, clientIP, requestID, signalScanner, reason)
+		rp.recordBodyBlockSignal(r, cfg, result, receiptInput, clientIP, requestID, signalScanner, receiptPattern)
 		writeReverseProxyBlock(w, http.StatusForbidden,
 			blockInfoFor(bodyBlockReason, layer).WithRequestID(requestID),
 			reason)

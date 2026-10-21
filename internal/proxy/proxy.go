@@ -205,6 +205,15 @@ type blockedRequestError struct {
 	detail string
 	target string
 	taint  *taintDecision
+	// receiptPattern retains the decisive pattern when reason includes diagnostics.
+	receiptPattern string
+}
+
+func (e *blockedRequestError) decisivePattern() string {
+	if e.receiptPattern != "" {
+		return e.receiptPattern
+	}
+	return e.reason
 }
 
 func (e *blockedRequestError) Error() string {
@@ -1129,8 +1138,11 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				if headerResult := scanRequestHeadersForTarget(req.Context(), req.Header, currentCfg, currentScanner, redirectURL); headerResult != nil {
 					action, hardBlock := headerDLPDecision(headerResult, currentCfg)
 					if hardBlock || (action == config.ActionBlock && currentCfg.EnforceEnabled()) {
-						logger.LogBlocked(redirectAuditCtx, "header_dlp", "redirect headers are not allowed at destination")
-						return newRedirectBlockedRequest("header_dlp", "redirect headers are not allowed at destination")
+						redirectReason := headerResult.withAudienceExplanation("redirect headers are not allowed at destination")
+						logger.LogBlocked(redirectAuditCtx, "header_dlp", redirectReason)
+						blockedErr := newRedirectBlockedRequest("header_dlp", redirectReason)
+						blockedErr.receiptPattern = "redirect blocked: redirect headers are not allowed at destination"
+						return blockedErr
 					}
 				}
 			}
@@ -5762,7 +5774,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Request header DLP scanning (fetch is GET-only, no body to scan).
 	// hadFinding is true even in audit/warn mode so RecordClean is not applied
 	// when a header DLP match was detected.
-	headerBlocked, headerHadFinding, headerReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
+	headerBlocked, headerHadFinding, headerReason, headerReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
 		headers: r.Header, cfg: cfg, sc: sc, logger: log, actx: actx,
 		hostname: parsed.Hostname(), target: displayURL, metricAgent: agentLabel, start: start,
 	})
@@ -5865,7 +5877,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				URL:         displayURL,
 				Agent:       agent,
 				Blocked:     true,
-				BlockReason: "request header contains secret",
+				BlockReason: headerReason,
 			})
 		return
 	}
@@ -6273,7 +6285,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
 				Layer:               blockedErr.layer,
-				Pattern:             blockedErr.reason,
+				Pattern:             blockedErr.decisivePattern(),
 				Transport:           "fetch",
 				Method:              http.MethodGet,
 				Target:              displayURL,
@@ -6420,7 +6432,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
 				Layer:               blockedErr.layer,
-				Pattern:             blockedErr.reason,
+				Pattern:             blockedErr.decisivePattern(),
 				Transport:           "fetch",
 				Method:              http.MethodGet,
 				Target:              redirectReceiptTarget(blockedErr, displayURL),

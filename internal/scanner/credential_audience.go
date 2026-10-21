@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"path"
@@ -41,6 +42,7 @@ type CredentialAudienceMismatch struct {
 	Surface     string   `json:"surface"`
 	Destination string   `json:"destination"`
 	Hosts       []string `json:"hosts"`
+	CoreRule    bool     `json:"core_rule,omitempty"`
 }
 
 type credentialAudienceCandidate struct {
@@ -666,15 +668,77 @@ func (s *Scanner) credentialAudienceMismatch(pattern *compiledPattern, target, s
 		return CredentialAudienceMismatch{}, false
 	}
 	host, ok := canonicalCredentialAudienceDestination(target)
-	if !ok || destination.MatchesDomainList(host, pattern.credentialAudienceHosts) {
+	if !ok || !credentialAudienceHostMismatch(host, pattern.credentialAudienceHosts, pattern.credentialAudienceGitHosts, pattern.credentialAudienceRegistryHosts) {
 		return CredentialAudienceMismatch{}, false
 	}
+	return newCredentialAudienceMismatch(pattern.name, surface, host), true
+}
+
+// Display only built-in audience hosts. Effective audiences can include private
+// operator declarations that must not be disclosed to unrelated destinations.
+func newCredentialAudienceMismatch(name, surface, destination string) CredentialAudienceMismatch {
 	return CredentialAudienceMismatch{
-		PatternName: pattern.name,
+		PatternName: name,
 		Surface:     surface,
-		Destination: host,
-		Hosts:       append([]string(nil), pattern.credentialAudienceHosts...),
-	}, true
+		Destination: destination,
+		Hosts:       config.BuiltInCredentialAudienceHosts(name),
+		CoreRule:    config.IsCoreDLPPatternName(name),
+	}
+}
+
+// credentialAudienceHostMismatch distinguishes an unrelated destination from a
+// rejected carrier at any declared audience host. It does not grant an allow.
+func credentialAudienceHostMismatch(host string, hosts, gitHosts, registryHosts []string) bool {
+	return len(hosts) != 0 &&
+		!destination.MatchesDomainList(host, hosts) &&
+		!destination.MatchesDomainList(host, gitHosts) &&
+		!destination.MatchesDomainList(host, registryHosts)
+}
+
+// TextDLPCredentialAudienceMismatches explains surviving text findings using
+// their compiled audience metadata. It never scans content or grants an allow.
+// Callers must pass the proxy-owned target after suppression and other filters.
+func TextDLPCredentialAudienceMismatches(matches []TextDLPMatch, target, surface string) []CredentialAudienceMismatch {
+	if len(matches) == 0 {
+		return nil
+	}
+	host, ok := canonicalCredentialAudienceDestination(target)
+	if !ok {
+		return nil
+	}
+	var mismatches []CredentialAudienceMismatch
+	seen := make(map[string]bool)
+	for _, match := range matches {
+		if seen[match.PatternName] || !credentialAudienceHostMismatch(host, match.credentialAudienceHosts, match.credentialAudienceGitHosts, match.credentialAudienceRegistryHosts) {
+			continue
+		}
+		seen[match.PatternName] = true
+		mismatches = append(mismatches, newCredentialAudienceMismatch(match.PatternName, surface, host))
+	}
+	return mismatches
+}
+
+// CredentialAudienceMismatchExplanation contains only pattern metadata and
+// canonical hostnames, never credential values, URL paths or query strings.
+func CredentialAudienceMismatchExplanation(mismatches []CredentialAudienceMismatch) string {
+	parts := make([]string, 0, len(mismatches))
+	for _, mismatch := range mismatches {
+		detail := fmt.Sprintf("credential audience mismatch (pattern %s, surface %s, canonical destination %s", mismatch.PatternName, mismatch.Surface, mismatch.Destination)
+		if len(mismatch.Hosts) > 0 {
+			detail += ", built-in audience hosts " + strings.Join(mismatch.Hosts, ", ")
+		}
+		if mismatch.CoreRule {
+			detail += "; immutable core rule, suppress does not apply"
+			switch {
+			case strings.EqualFold(mismatch.PatternName, "GitHub Token"), strings.EqualFold(mismatch.PatternName, "GitHub Fine-Grained PAT"):
+				detail += "; enterprise-host configuration (eligible headers only): dlp.github_enterprise_hosts"
+			case strings.EqualFold(mismatch.PatternName, "GitLab PAT"):
+				detail += "; enterprise-host configuration (eligible headers only): dlp.gitlab_hosts"
+			}
+		}
+		parts = append(parts, detail+")")
+	}
+	return strings.Join(parts, "; ")
 }
 
 // FilterTextDLPMatchesForDestination applies the compiled-only audience rule
@@ -1497,6 +1561,13 @@ func sasValidityWindow(query url.Values) (time.Time, time.Time, bool) {
 	return start, expiry, err == nil && expiry.After(start)
 }
 
+const (
+	githubDownloadGrantValidityNote = "GitHub download grant outside its validity window; check the host clock or obtain a current download URL"
+	githubDownloadSASValidityNote   = "GitHub download SAS outside its validity window; check the host clock or obtain a current download URL"
+	githubAttestationValidityNote   = "GitHub attestation SAS outside its validity window; check the host clock or obtain a current bundle URL"
+	githubActionsValidityNote       = "GitHub Actions results SAS outside its validity window; check the host clock or obtain a current log or artifact URL"
+)
+
 // queryGrantValidityNote names a validity window as the cause of a URL DLP
 // block. A grant outside its window at now nominates a time inside that
 // window, and the note is returned only when DLP at that time allows the URL.
@@ -1527,9 +1598,9 @@ func queryGrantValidityCandidate(parsed *url.URL, now time.Time) (string, time.T
 			case !valid:
 				continue
 			case !grantValidityWindowValid(start, expiry, now):
-				return "GitHub download grant outside its validity window; check the host clock or obtain a current download URL", start, true
+				return githubDownloadGrantValidityNote, start, true
 			case !sasValidityWindowValid(query, now):
-				return "GitHub download SAS outside its validity window; check the host clock or obtain a current download URL", start, true
+				return githubDownloadSASValidityNote, start, true
 			}
 		}
 	}
@@ -1537,14 +1608,14 @@ func queryGrantValidityCandidate(parsed *url.URL, now time.Time) (string, time.T
 		!attestationBundleSASQueryValid(parsed, now) {
 		start, err := time.Parse(time.RFC3339, query.Get("st"))
 		if err == nil && attestationBundleSASQueryValid(parsed, start) {
-			return "GitHub attestation SAS outside its validity window; check the host clock or obtain a current bundle URL", start, true
+			return githubAttestationValidityNote, start, true
 		}
 	}
 	if destination.MatchesDomainList(host, githubActionsResultsHosts) && actionsResultsPath(parsed) &&
 		!attestationBundleSASQueryValid(parsed, now) {
 		start, err := time.Parse(time.RFC3339, query.Get("st"))
 		if err == nil && attestationBundleSASQueryValid(parsed, start) {
-			return "GitHub Actions results SAS outside its validity window; check the host clock or obtain a current log or artifact URL", start, true
+			return githubActionsValidityNote, start, true
 		}
 	}
 	return "", time.Time{}, false

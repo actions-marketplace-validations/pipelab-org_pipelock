@@ -1418,6 +1418,9 @@ func newInterceptHandler(
 					}
 				}
 
+				receiptPattern := reason
+				reason = result.withAudienceExplanation(reason)
+
 				// DLP-only exemption: DLP pattern findings on adaptive-exempt
 				// destinations should not feed escalation scoring or get action
 				// upgrades. Separate from api_allowlist (reachability) to avoid
@@ -1462,7 +1465,7 @@ func newInterceptHandler(
 				// tunnels, so it fails closed here.
 				if promptInjectionHardBlock || dlpHardBlock || isFailClosedBodyResult(result, bodyBytes) || action == config.ActionAsk || (action == config.ActionBlock && ic.Config.EnforceEnabled()) {
 					if !bodyAdaptiveExempt {
-						interceptRecordFinding(ic, session.SignalBlock, scannerLabel, reason)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabel, receiptPattern)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabel, reason)
 					ic.Metrics.RecordTLSRequestBlocked(scannerLabel)
@@ -1470,7 +1473,7 @@ func newInterceptHandler(
 						ActionID:  actionID,
 						Verdict:   config.ActionBlock,
 						Layer:     scannerLabel,
-						Pattern:   reason,
+						Pattern:   receiptPattern,
 						Transport: "intercept",
 						Method:    r.Method,
 						Target:    targetURL,
@@ -1489,7 +1492,7 @@ func newInterceptHandler(
 				// without any escalation, which is not the intent.
 				if action == config.ActionBlock && action != originalBodyAction && !ic.Config.EnforceEnabled() {
 					if !bodyAdaptiveExempt {
-						interceptRecordFinding(ic, session.SignalBlock, scannerLabel, reason)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabel, receiptPattern)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabel, reason+" (escalated)")
 					ic.Metrics.RecordTLSRequestBlocked(scannerLabel)
@@ -1497,7 +1500,7 @@ func newInterceptHandler(
 						ActionID:  actionID,
 						Verdict:   config.ActionBlock,
 						Layer:     scannerLabel,
-						Pattern:   reason + " (escalated)",
+						Pattern:   receiptPattern + " (escalated)",
 						Transport: "intercept",
 						Method:    r.Method,
 						Target:    targetURL,
@@ -1686,14 +1689,15 @@ func newInterceptHandler(
 						RequestID:  ic.RequestID,
 					})
 				}
-				ic.Logger.LogHeaderDLP(actx, headerResult.HeaderName, action, dlpMatchNames(headerResult.DLPMatches), dlpBundleRules(headerResult.DLPMatches))
-				reason := "request header contains secret"
+				ic.Logger.LogHeaderDLP(actx, headerResult.HeaderName, action, dlpMatchNames(headerResult.DLPMatches), dlpBundleRules(headerResult.DLPMatches), headerResult.CredentialAudienceMismatches...)
+				receiptPattern := "request header contains secret"
 				if escalatedBlock && !ic.Config.EnforceEnabled() {
-					reason += " (escalated)"
+					receiptPattern += " (escalated)"
 				}
+				reason := headerResult.withAudienceExplanation(receiptPattern)
 				// ActionAsk: no HITL terminal in intercepted tunnels, fail closed.
 				if headerHardBlock || action == config.ActionAsk || (action == config.ActionBlock && (ic.Config.EnforceEnabled() || escalatedBlock)) {
-					interceptRecordFinding(ic, session.SignalBlock, scanner.ScannerDLP, reason)
+					interceptRecordFinding(ic, session.SignalBlock, scanner.ScannerDLP, receiptPattern)
 					ic.Logger.LogBlockedDetail(actx, "header_dlp", reason, audit.BlockDetail{
 						Header: headerResult.HeaderName, Patterns: dlpMatchNames(headerResult.DLPMatches),
 						Cookies: cookieNamesWithDLPMatch(r.Context(), scanHeaders, ic.Scanner),
@@ -1703,7 +1707,7 @@ func newInterceptHandler(
 						ActionID:  actionID,
 						Verdict:   config.ActionBlock,
 						Layer:     "header_dlp",
-						Pattern:   reason,
+						Pattern:   receiptPattern,
 						Transport: "intercept",
 						Method:    r.Method,
 						Target:    targetURL,
@@ -2030,7 +2034,7 @@ func newInterceptHandler(
 					ActionID:  actionID,
 					Verdict:   config.ActionBlock,
 					Layer:     blockedErr.layer,
-					Pattern:   blockedErr.reason,
+					Pattern:   blockedErr.decisivePattern(),
 					Transport: "intercept",
 					Method:    r.Method,
 					Target:    targetURL,
