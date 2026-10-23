@@ -307,6 +307,7 @@ func TestRunHTTPProxy_UpstreamUsesConfiguredDialContext(t *testing.T) {
 
 func TestRunHTTPProxy_RedactsToolCallArguments(t *testing.T) {
 	secret := mcpRedactionSecret()
+	logger, events := newListenerEventLogger(t)
 	var upstreamBody bytes.Buffer
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -328,12 +329,17 @@ func TestRunHTTPProxy_RedactsToolCallArguments(t *testing.T) {
 
 	err := RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{
 		Scanner:       sc,
+		AuditLogger:   logger,
 		RedactMatcher: testHTTPRedactionMatcher(),
 		RedactLimits:  redact.DefaultLimits().ToLimits(),
 		RedactProfile: "code",
 	})
 	if err != nil {
 		t.Fatalf("RunHTTPProxy: %v", err)
+	}
+
+	if strings.Contains(events.String(), `"event":"blocked"`) {
+		t.Fatal(events.String())
 	}
 
 	var envelope struct {
@@ -463,12 +469,17 @@ func TestRunHTTPProxy_BlocksInjectedResponse(t *testing.T) {
 	t.Cleanup(sc.Close)
 
 	stdin := strings.NewReader(jsonToolsCallEcho + "\n")
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr, events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: sc})
+	err = RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: sc, AuditLogger: logger})
 	if err != nil {
 		t.Fatalf("RunHTTPProxy: %v", err)
 	}
@@ -491,6 +502,9 @@ func TestRunHTTPProxy_BlocksInjectedResponse(t *testing.T) {
 	}
 	if rpc.Error.Code != -32000 {
 		t.Errorf("error code = %d, want -32000\noutput: %s", rpc.Error.Code, output)
+	}
+	if !strings.Contains(events.String(), `"event":"blocked"`) || strings.Contains(events.String(), "IGNORE ALL PREVIOUS INSTRUCTIONS") {
+		t.Fatalf("HTTP response audit missing or leaked response text: %s", events.String())
 	}
 }
 
@@ -927,11 +941,16 @@ func TestRunHTTPProxy_InputDLPBlocking(t *testing.T) {
 	}
 
 	stdin := strings.NewReader(input + "\n")
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr, events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
+	err = RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, AuditLogger: logger})
 	if err != nil {
 		t.Fatalf("RunHTTPProxy: %v", err)
 	}
@@ -946,6 +965,12 @@ func TestRunHTTPProxy_InputDLPBlocking(t *testing.T) {
 	}
 	if atomic.LoadInt32(&serverCalled) != 0 {
 		t.Error("server should NOT be called when input is blocked")
+	}
+	if strings.Count(events.String(), `"event":"blocked"`) != 1 ||
+		!strings.Contains(events.String(), `"scanner":"`+scanner.AuditMCPInputDLP+`"`) ||
+		!strings.Contains(events.String(), "mcp_input_scanning.action") ||
+		strings.Contains(events.String(), prefix+fakeKey) {
+		t.Fatalf("HTTP input audit missing or leaked credential: %s", events.String())
 	}
 }
 
@@ -1219,6 +1244,12 @@ func TestUpstreamErrorResponse_NilID(t *testing.T) {
 }
 
 func TestScanHTTPInput_ParseError(t *testing.T) {
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	cfg := config.Defaults()
 	cfg.Internal = nil
 	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
@@ -1232,12 +1263,17 @@ func TestScanHTTPInput_ParseError(t *testing.T) {
 	}
 
 	// Invalid JSON-RPC - not valid JSON.
-	blocked := scanHTTPInput([]byte(`not json`), io.Discard, "", "", MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
+	blocked := scanHTTPInput([]byte(`not json`), io.Discard, "", "", MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, AuditLogger: logger})
 	if blocked == nil {
 		t.Fatal("expected parse error to block")
 	}
 	if blocked.LogMessage != "blocked (parse error)" {
 		t.Errorf("LogMessage = %q, want %q", blocked.LogMessage, "blocked (parse error)")
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditMCPInputInspection+`"`) ||
+		!strings.Contains(got, `"block_class":"infrastructure_error"`) || strings.Contains(got, "not json") {
+		t.Fatalf("HTTP parse denial audit event = %s", got)
 	}
 }
 
@@ -1546,12 +1582,14 @@ func TestScanHTTPInput_PolicyRedirectSuccess(t *testing.T) {
 
 	msg := jsonToolsCallDangerous
 	var logW bytes.Buffer
-	blocked := scanHTTPInput([]byte(msg), &logW, "", "", MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
-	if blocked == nil {
-		t.Fatal("expected redirect result (not nil)")
+	logger, events := newListenerEventLogger(t)
+	decision := scanHTTPInputDecision([]byte(msg), &logW, "", "", MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg, AuditLogger: logger})
+	if decision.Blocked != nil || decision.Synthetic == nil {
+		t.Fatal("expected successful synthetic redirect")
 	}
-	if blocked.SyntheticResponse == nil {
-		t.Fatal("expected synthetic response for successful redirect")
+
+	if strings.Contains(events.String(), `"event":"blocked"`) {
+		t.Fatal(events.String())
 	}
 
 	var resp struct {
@@ -1561,7 +1599,7 @@ func TestScanHTTPInput_PolicyRedirectSuccess(t *testing.T) {
 			} `json:"content"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(blocked.SyntheticResponse, &resp); err != nil {
+	if err := json.Unmarshal(decision.Synthetic.response, &resp); err != nil {
 		t.Fatalf("invalid synthetic response: %v", err)
 	}
 	if len(resp.Result.Content) == 0 {
@@ -1603,11 +1641,8 @@ func TestScanHTTPInputDecision_A2APolicyRedirectReceivesRedactedParams(t *testin
 		RedactMatcher: testRedactionMatcher(),
 		RedactLimits:  redact.DefaultLimits().ToLimits(),
 	})
-	if decision.Blocked == nil {
+	if decision.Synthetic == nil || decision.Blocked != nil {
 		t.Fatal("expected A2A redirect synthetic response")
-	}
-	if decision.Blocked.SyntheticResponse == nil {
-		t.Fatalf("expected synthetic response, got block: %+v", decision.Blocked)
 	}
 	var resp struct {
 		Result struct {
@@ -1616,7 +1651,7 @@ func TestScanHTTPInputDecision_A2APolicyRedirectReceivesRedactedParams(t *testin
 			} `json:"content"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal(decision.Blocked.SyntheticResponse, &resp); err != nil {
+	if err := json.Unmarshal(decision.Synthetic.response, &resp); err != nil {
 		t.Fatalf("invalid synthetic response: %v", err)
 	}
 	if len(resp.Result.Content) == 0 {
@@ -3322,6 +3357,12 @@ func TestRunHTTPListenerProxy_BlockedResponse_EmitsReceipt(t *testing.T) {
 	t.Cleanup(sc.Close)
 
 	emitter, rec, dir, pubHex := newReceiptTestHarness(t)
+	var events lockedHTTPBuffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -3338,6 +3379,7 @@ func TestRunHTTPListenerProxy_BlockedResponse_EmitsReceipt(t *testing.T) {
 		done <- RunHTTPListenerProxy(ctx, ln, upstream.URL, &logBuf, MCPProxyOpts{
 			Scanner:        sc,
 			ReceiptEmitter: emitter,
+			AuditLogger:    logger,
 		})
 	}()
 
@@ -3363,6 +3405,9 @@ func TestRunHTTPListenerProxy_BlockedResponse_EmitsReceipt(t *testing.T) {
 	}
 	if !strings.Contains(string(payload), "injection detected") {
 		t.Fatalf("expected block response, got: %s", payload)
+	}
+	if !strings.Contains(events.String(), `"event":"blocked"`) || strings.Contains(events.String(), "IGNORE ALL PREVIOUS INSTRUCTIONS") {
+		t.Fatalf("listener response audit missing or leaked response text: %s", events.String())
 	}
 
 	// Cleanup is handled by t.Cleanup registered above. Close the
@@ -6216,8 +6261,8 @@ func TestScanHTTPInput_RedirectOutputWarnPreservesWarnContext(t *testing.T) {
 		PolicyHash: "stale-policy-hash",
 	})
 
-	blocked := scanHTTPInput(msg, &logBuf, "sess", "sess", opts)
-	if blocked == nil || blocked.SyntheticResponse == nil {
+	decision := scanHTTPInputDecision(msg, &logBuf, "sess", "sess", opts)
+	if decision.Blocked != nil || decision.Synthetic == nil {
 		t.Fatal("expected synthetic response for warn-only redirect output")
 	}
 
@@ -6273,12 +6318,9 @@ func TestScanHTTPInput_RedirectWithAuditLogger(t *testing.T) {
 
 	al := audit.NewNop()
 	var logBuf bytes.Buffer
-	blocked := scanHTTPInput(msg, &logBuf, "sess", "sess", MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg, AuditLogger: al})
-	if blocked == nil {
-		t.Fatal("expected redirect to return a blocked request")
-	}
-	if blocked.SyntheticResponse == nil {
-		t.Error("expected synthetic response for successful redirect")
+	decision := scanHTTPInputDecision(msg, &logBuf, "sess", "sess", MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg, AuditLogger: al})
+	if decision.Blocked != nil || decision.Synthetic == nil {
+		t.Fatal("expected successful synthetic redirect")
 	}
 	if !strings.Contains(logBuf.String(), "redirected") {
 		t.Errorf("expected 'redirected' in log, got: %s", logBuf.String())
@@ -6367,6 +6409,12 @@ func TestScanHTTPInput_AdaptiveUpgradeWithAuditLogger(t *testing.T) {
 }
 
 func TestRunHTTPProxy_AdaptiveBlockAllCleanMessage(t *testing.T) {
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	// Server should NOT be called - blocked before upstream.
 	var serverCalled int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -6408,7 +6456,7 @@ func TestRunHTTPProxy_AdaptiveBlockAllCleanMessage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, Store: store, AdaptiveCfg: adaptiveCfg})
+	err = RunHTTPProxy(ctx, stdin, &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, Store: store, AdaptiveCfg: adaptiveCfg, AuditLogger: logger})
 	if err != nil {
 		t.Fatalf("RunHTTPProxy: %v", err)
 	}
@@ -6436,6 +6484,11 @@ func TestRunHTTPProxy_AdaptiveBlockAllCleanMessage(t *testing.T) {
 	// Log must mention adaptive upgrade.
 	if !strings.Contains(stderr.String(), "adaptive upgrade") {
 		t.Errorf("expected adaptive upgrade log in stderr, got: %s", stderr.String())
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditAdaptiveEnforcement+`"`) ||
+		!strings.Contains(got, "affected identity session") {
+		t.Fatalf("clean adaptive denial audit event = %s", got)
 	}
 }
 

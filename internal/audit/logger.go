@@ -392,6 +392,9 @@ func (l *Logger) LogBlockedDetail(ctx LogContext, scanner, reason string, detail
 		optStr("display_label", displayLabel).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scanner, reason)).
 		optStr("mitre_technique", technique)
+	if ctx.mcp {
+		e.optStr("block_class", detail.Class).str("protocol", "mcp").optStr("transport", ctx.mcpTransport).optStr("direction", ctx.mcpDirection)
+	}
 	if len(detail.Patterns) > 0 {
 		e.strs("patterns", detail.Patterns)
 	}
@@ -1379,4 +1382,16 @@ func (l *Logger) Close() {
 		_ = l.fileHandle.Close()
 		l.fileHandle = nil
 	}
+}
+
+// LogMCPBlocked records a terminal MCP refusal with an explicit evidence class.
+// The typed context marker, rather than a request method, enables MCP fields.
+func (l *Logger) LogMCPBlocked(ctx LogContext, label, reason string, detail BlockDetail) {
+	if !ctx.mcp {
+		return
+	}
+	if detail.Class == "" {
+		detail.Class = BlockClassThreat
+	}
+	l.LogBlockedDetail(ctx, label, reason, detail)
 }

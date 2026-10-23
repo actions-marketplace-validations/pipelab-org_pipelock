@@ -113,6 +113,33 @@ func TestAgentThreatDetectionAttrs_ActionMappingForLegacyBlockedEvents(t *testin
 	}
 }
 
+func TestAgentThreatDetectionAttrsOmitsOperationalBlocks(t *testing.T) {
+	event := Event{Type: eventTypeBlocked, Fields: map[string]any{
+		"protocol": "mcp", "method": "MCP", "resource": "mcp_response", fieldScanner: "mcp_response_inspection", "block_class": "infrastructure_error",
+	}}
+	if got := agentThreatDetectionAttrs(event, "test"); len(got) != 0 {
+		t.Fatalf("operational block projected as agent threat: %+v", got)
+	}
+}
+
+func TestAgentThreatDetectionAttrsPreservesHTTPBlockProjection(t *testing.T) {
+	for _, tc := range []struct{ method, scanner, class string }{
+		{"GET", "ratelimit", "protective"},
+		{"GET", "databudget", "protective"},
+		{"GET", "ssrf", "infrastructure_error"},
+		{"GET", "allowlist", "config_mismatch"},
+		{"MCP", "ratelimit", "protective"},
+	} {
+		t.Run(tc.method+"/"+tc.scanner, func(t *testing.T) {
+			fields := map[string]any{"method": tc.method, "url": "https://api.vendor.example/path", fieldScanner: tc.scanner, "block_class": tc.class}
+			got := agentThreatDetectionAttrs(Event{Type: eventTypeBlocked, Fields: fields}, testBinaryVersion)
+			if len(got) != 4 || got[0].GetValue().GetStringValue() != tc.scanner || got[3].GetValue().GetStringValue() != conventionActionBlock {
+				t.Fatalf("HTTP %s block lost origin/main agent-threat projection: %+v", tc.scanner, got)
+			}
+		})
+	}
+}
+
 func TestAgentThreatDetectionAttrs_SeverityMapping(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -587,4 +614,26 @@ func lookup(attrs []*commonpb.KeyValue, key string) string {
 		}
 	}
 	return ""
+}
+
+func TestMCPDenialNativeOTLPFixture(t *testing.T) {
+	for _, method := range []string{"MCP", "CEE"} {
+		for _, class := range []string{"threat", "protective", "infrastructure_error", "config_mismatch", "structural_exemption"} {
+			event := Event{Type: EventBlocked, Timestamp: time.Unix(1, 0), Fields: map[string]any{"protocol": "mcp", "method": method, "transport": "mcp_stdio", "direction": "input", "block_class": class, "scanner": "cross_request_fragment_capacity"}}
+			sink := &OTLPSink{version: "fixture"}
+			sink.EnableAgentThreatDetection()
+			record := sink.eventToLogRecord(event)
+			fields := map[string]string{}
+			for _, attr := range record.Attributes {
+				fields[attr.Key] = attr.Value.GetStringValue()
+			}
+			if fields["block_class"] != class || fields["protocol"] != "mcp" || fields["method"] != method {
+				t.Fatal(fields)
+			}
+			_, projected := fields["agent.threat.detection.action"]
+			if projected != (class == "threat") {
+				t.Fatalf("class=%s attrs=%v", class, fields)
+			}
+		}
+	}
 }

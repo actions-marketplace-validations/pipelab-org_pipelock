@@ -381,6 +381,12 @@ func TestRunWSProxy_BlocksInjectedResponse(t *testing.T) {
 
 	pr, pw := io.Pipe()
 	var stdout, stderr lockedHTTPBuffer
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -390,7 +396,7 @@ func TestRunWSProxy_BlocksInjectedResponse(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		proxyErr = RunWSProxy(ctx, pr, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc})
+		proxyErr = RunWSProxy(ctx, pr, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, AuditLogger: logger})
 	}()
 
 	_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}` + "\n"))
@@ -411,6 +417,9 @@ func TestRunWSProxy_BlocksInjectedResponse(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "injection detected") {
 		t.Errorf("expected injection log on stderr, got: %s", stderr.String())
+	}
+	if !strings.Contains(events.String(), `"event":"blocked"`) || strings.Contains(events.String(), "IGNORE ALL PREVIOUS INSTRUCTIONS") {
+		t.Fatalf("WS response audit missing or leaked response text: %s", events.String())
 	}
 }
 
@@ -746,11 +755,17 @@ func TestRunWSProxy_ToolPolicyBlocks(t *testing.T) {
 
 	stdin := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}` + "\n")
 	var stdout, stderr bytes.Buffer
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := RunWSProxy(ctx, stdin, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, PolicyCfg: policyCfg})
+	err = RunWSProxy(ctx, stdin, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, PolicyCfg: policyCfg, AuditLogger: logger})
 	if err != nil {
 		t.Fatalf("RunWSProxy: %v", err)
 	}
@@ -762,11 +777,24 @@ func TestRunWSProxy_ToolPolicyBlocks(t *testing.T) {
 	if got := upstreamFrames.Load(); got != 0 {
 		t.Errorf("tool policy block forwarded %d frame(s) upstream, want 0", got)
 	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 || !strings.Contains(got, `"scanner":"`+scanner.AuditMCPToolPolicy+`"`) || !strings.Contains(got, "mcp_tool_policy.rules") {
+		t.Fatalf("WS tool policy block missing one correctly labeled event: %s", got)
+	}
 }
 
 func TestRunWSProxy_ChainDetectionBlocks(t *testing.T) {
-	// Server echoes a response for every client message.
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
+	// Only text messages are MCP requests. Replying to the shutdown close
+	// frame would invent a duplicate response for the already-consumed ID 1.
+	var upstreamRequests atomic.Int64
+	upstreamClosed := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(upstreamClosed)
 		conn, _, _, err := ws.UpgradeHTTP(r, w)
 		if err != nil {
 			return
@@ -777,9 +805,15 @@ func TestRunWSProxy_ChainDetectionBlocks(t *testing.T) {
 			if readErr != nil {
 				return
 			}
-			for range msgs {
-				_ = gobwasutil.WriteServerMessage(conn, ws.OpText,
-					[]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`))
+			for _, msg := range msgs {
+				if msg.OpCode != ws.OpText {
+					continue
+				}
+				upstreamRequests.Add(1)
+				if err := gobwasutil.WriteServerMessage(conn, ws.OpText,
+					[]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}]}}`)); err != nil {
+					return
+				}
 			}
 		}
 	}))
@@ -822,22 +856,44 @@ func TestRunWSProxy_ChainDetectionBlocks(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		proxyErr = RunWSProxy(ctx, pr, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, ChainMatcher: chainMatcher})
+		proxyErr = RunWSProxy(ctx, pr, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, ChainMatcher: chainMatcher, AuditLogger: logger})
 	}()
 
 	// First tool call: read_file.
-	_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{}}}` + "\n"))
+	if _, err := pw.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{}}}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	testwait.For(t, 2*time.Second, func() bool {
+		return stdout.contains(`"id":1,"result"`)
+	}, "first tool response delivered before the chain denial")
 	// Second tool call: send_message (should trigger chain).
-	_, _ = pw.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{}}}` + "\n"))
+	if _, err := pw.Write([]byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{}}}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	testwait.For(t, 2*time.Second, func() bool {
+		return stdout.contains(`"id":2,"error"`)
+	}, "chain denial delivered before stdin closes")
 	_ = pw.Close()
 
 	wg.Wait()
+	waitForSignal(t, upstreamClosed, "chain fixture upstream closed")
 	if proxyErr != nil {
 		t.Fatalf("RunWSProxy: %v", proxyErr)
 	}
 
 	if !strings.Contains(stderr.String(), "chain detected") {
 		t.Errorf("expected chain detection log, got stderr: %s", stderr.String())
+	}
+	if got := upstreamRequests.Load(); got != 1 {
+		t.Errorf("upstream received %d request(s), want only the first tool call", got)
+	}
+	if strings.Contains(stdout.String(), "unsolicited response") {
+		t.Errorf("fixture produced an unsolicited response: %s", stdout.String())
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditChainDetection+`"`) ||
+		!strings.Contains(got, "tool_chain_detection.pattern_overrides") {
+		t.Fatalf("WS chain denial audit event = %s", got)
 	}
 }
 
@@ -862,12 +918,17 @@ func TestRunWSProxy_InputDLPWithAuditLogger(t *testing.T) {
 		OnParseError: config.ActionBlock,
 	}
 
-	al := audit.NewNop()
+	var events bytes.Buffer
+	al, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(al.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := RunWSProxy(ctx, stdin, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, AuditLogger: al})
+	err = RunWSProxy(ctx, stdin, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, AuditLogger: al})
 	if err != nil {
 		t.Fatalf("RunWSProxy: %v", err)
 	}
@@ -878,6 +939,12 @@ func TestRunWSProxy_InputDLPWithAuditLogger(t *testing.T) {
 	}
 	if got := upstreamFrames.Load(); got != 0 {
 		t.Errorf("blocked audit-logged input forwarded %d frame(s) upstream, want 0", got)
+	}
+	if strings.Count(events.String(), `"event":"blocked"`) != 1 ||
+		!strings.Contains(events.String(), `"scanner":"`+scanner.AuditMCPInputDLP+`"`) ||
+		!strings.Contains(events.String(), "mcp_input_scanning.action") ||
+		strings.Contains(events.String(), fakeKey) {
+		t.Fatalf("WS input audit missing or leaked credential: %s", events.String())
 	}
 }
 

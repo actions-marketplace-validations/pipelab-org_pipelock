@@ -60,8 +60,9 @@ func TestAdaptiveListenerWarningAndIndependentRefusal(t *testing.T) {
 			sc := scanner.MustNew(cfg)
 			t.Cleanup(sc.Close)
 			rec := &mockRecorder{}
+			logger, events := newListenerEventLogger(t)
 			baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
-				Scanner: sc, Store: &airlockRecorderStore{rec: rec},
+				AuditLogger: logger, Scanner: sc, Store: &airlockRecorderStore{rec: rec},
 				AdaptiveCfg: adaptiveCfgEnabled(), listenerStateTokenRequired: boolPtr(true),
 			})
 			token := listenerSetupToken(t, baseURL)
@@ -88,9 +89,13 @@ func TestAdaptiveListenerWarningAndIndependentRefusal(t *testing.T) {
 			if resp.StatusCode != http.StatusBadRequest || string(body) != "invalid argument" || rec.ThreatScore() != before {
 				t.Fatalf("benign refusal: status=%d body=%s score=%v want=%v", resp.StatusCode, body, rec.ThreatScore(), before)
 			}
+			blocksBefore := strings.Count(events.String(), `"event":"blocked"`)
 			resp, body = request("refusal", 31)
 			if resp.StatusCode != http.StatusBadGateway || strings.Contains(string(body), upstreamStatusInjection) {
 				t.Fatalf("independent refusal: status=%d body=%s", resp.StatusCode, body)
+			}
+			if got := strings.Count(events.String(), `"event":"blocked"`); got != blocksBefore+1 || !strings.Contains(events.String(), `"scanner":"response_scan"`) || !strings.Contains(events.String(), `"block_class":"threat"`) {
+				t.Fatalf("independent refusal lost its canonical event: %s", events.String())
 			}
 			if got, want := rec.ThreatScore(), before+session.SignalPoints[session.SignalBlock]; got != want {
 				t.Fatalf("independent refusal score=%v want=%v", got, want)

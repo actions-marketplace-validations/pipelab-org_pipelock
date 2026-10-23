@@ -20,6 +20,10 @@ import (
 //   - Target: CONNECT tunnel host:port destinations
 //   - Resource: MCP tool names, config file paths, listen addresses
 type LogContext struct {
+	mcp             bool
+	mcpMarker       bool
+	mcpTransport    string
+	mcpDirection    string
 	method          string
 	url             string // actual HTTP URL
 	target          string // CONNECT host:port
@@ -149,7 +153,9 @@ func NewMCPLogContext(method, resource, agent string) (LogContext, error) {
 	if resource == "" {
 		return LogContext{}, errLogContextMissingResource
 	}
-	return newLogContext(LogContextOpts{Method: method, Resource: resource, Agent: agent})
+	ctx, err := newLogContext(LogContextOpts{Method: method, Resource: resource, Agent: agent})
+	ctx.mcp = true
+	return ctx, err
 }
 
 // NewConnectLogContext creates a LogContext for CONNECT tunnel operations.
@@ -190,4 +196,25 @@ func NewClientRequestLogContext(method, clientIP, requestID string) LogContext {
 func NewMethodLogContext(method string) LogContext {
 	ctx, _ := newLogContext(LogContextOpts{Method: method})
 	return ctx
+}
+
+// WithMCPProtocolMarker records that the MCP denial finalizer chose this
+// context's resource from its fixed catalog. Only such a resource can bypass
+// content redaction; a tool name supplied by a client or upstream never can,
+// even when it spells a marker.
+func (c LogContext) WithMCPProtocolMarker() LogContext {
+	if c.mcp {
+		c.mcpMarker = true
+	}
+	return c
+}
+
+// WithMCPRoute attaches proxy-owned routing metadata. HTTP contexts cannot opt
+// into the MCP event contract by supplying a method named MCP.
+func (c LogContext) WithMCPRoute(transport, direction string) LogContext {
+	if c.mcp {
+		c.mcpTransport = transport
+		c.mcpDirection = direction
+	}
+	return c
 }

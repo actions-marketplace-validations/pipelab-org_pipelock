@@ -71,6 +71,114 @@ on a sink to receive the info events as well.
 | `response_scan_suppressed` | Response-scan finding withheld from enforcement | `mode`, `pattern`, `surface`, `reason` (`suppressed` or `core_observed`), `observe_host`, `observe_owner`, `observe_expires`, `observe_reason` (`core_observed` only), `client_ip`, `request_id` |
 | `error` | Internal error during request processing | `method`, `url`, `client_ip`, `request_id`, `error` |
 
+MCP `blocked` events use `fields.scanner` for the gate that denied the call.
+The labels below are checked against the MCP denial catalog by a test. `block_class` separates content findings from
+protective, configuration, and inspection refusals.
+
+<!-- BEGIN MCP blocked scanner labels -->
+| Scanner | MCP denial |
+|---------|------------|
+| `a2a_scan` | A2A input finding, inspection limit, or inspection failure |
+| `adaptive_enforcement` | Session-level action upgrade |
+| `address_protection` | Address protection finding |
+| `agent_identity` | Server identity revoked |
+| `airlock` | Session airlock refusal |
+| `allowlist` | Embedded URL destination check; see the scanner guidance for this label |
+| `blocklist` | Embedded URL destination check; see the scanner guidance for this label |
+| `chain_detection` | Tool-call chain finding |
+| `context` | Embedded URL destination check; see the scanner guidance for this label |
+| `contract` | Contract refusal or evaluation failure |
+| `core_dlp` | Embedded URL destination check; see the scanner guidance for this label |
+| `core_ssrf` | Embedded URL destination check; see the scanner guidance for this label |
+| `crlf_injection` | Embedded URL destination check; see the scanner guidance for this label |
+| `cross_request_entropy` | Cross-request entropy budget refusal |
+| `cross_request_fragment` | Reassembled credential or inspection-limit refusal |
+| `cross_request_fragment_capacity` | Fragment inspection state capacity exhausted |
+| `cross_request_fragment_owner_mismatch` | Fragment stream belongs to another identity |
+| `databudget` | Embedded URL destination check; see the scanner guidance for this label |
+| `denial_of_wallet` | Tool-use budget or expansion finding |
+| `dlp` | Embedded URL destination check; see the scanner guidance for this label |
+| `entropy` | Embedded URL destination check; see the scanner guidance for this label |
+| `frozen_tool` | Tool absent from frozen inventory |
+| `kill_switch` | Active kill switch, including held-call cancellation |
+| `length` | Embedded URL destination check; see the scanner guidance for this label |
+| `mcp_defer` | Defer unavailable, hold failure, or terminal deferred refusal |
+| `mcp_header_dlp` | Text DLP finding in a selected listener request header |
+| `mcp_header_injection` | Injection finding in a decoded `Mcp-Param-*` value |
+| `mcp_header_inspection` | Parameter-header inspection failure |
+| `mcp_input_dlp` | Credential in a request |
+| `mcp_input_injection` | Instruction in request arguments |
+| `mcp_input_inspection` | Request inspection failure |
+| `mcp_protocol` | Listener admission, protocol or state-capacity refusal; unsupported request or response batch |
+| `mcp_redirect` | Redirect profile or handler failure, or unsupported batch redirect |
+| `mcp_redirect_output_dlp` | Credential in redirect handler output |
+| `mcp_redirect_output_injection` | Instruction in redirect handler output |
+| `mcp_response_inspection` | Uninspectable upstream response |
+| `mcp_session_binding` | Session inventory mismatch |
+| `mcp_tool_policy` | Matched tool rule |
+| `media_policy` | Response media policy or inspection refusal |
+| `mediation_envelope` | Mediation envelope injection failure |
+| `parser` | Embedded URL destination check; see the scanner guidance for this label |
+| `path_traversal` | Embedded URL destination check; see the scanner guidance for this label |
+| `provenance` | Tool signature verification refusal |
+| `ratelimit` | Embedded URL destination check; see the scanner guidance for this label |
+| `receipt_emission` | Required receipt unavailable |
+| `redaction` | Request redaction could not complete safely |
+| `request_policy` | Action authority refusal |
+| `response_scan` | Upstream response content or inspection refusal |
+| `scanner_unavailable` | Scanner unavailable |
+| `scheme` | Embedded URL destination check; see the scanner guidance for this label |
+| `session_anomaly` | Behavioral baseline deviation |
+| `ssrf` | Embedded URL destination check; see the scanner guidance for this label |
+| `ssrf_metadata` | Embedded URL destination check; see the scanner guidance for this label |
+| `subdomain_entropy` | Embedded URL destination check; see the scanner guidance for this label |
+| `taint_policy` | Tainted action refusal |
+| `tool_scanning` | Tool definition finding or operational inventory refusal |
+<!-- END MCP blocked scanner labels -->
+
+Listener header DLP scans selected request header names and values as text.
+Decoded `Mcp-Param-*` values receive response injection scanning too.
+`Last-Event-ID`, `Mcp-Param-*`, and `Mcp-Session-Id` are always selected;
+`Authorization` is selected by default. The other selections follow
+`request_body_scanning.scan_headers`, `header_mode`, `sensitive_headers`, and
+`ignore_headers`. A tools/list capacity refusal under `tool_scanning` and
+an uninspectable response under `mcp_response_inspection` use
+`block_class: infrastructure_error`, carry no MITRE technique, and omit
+agent-threat attributes. MCP operational blocks retain their native OTLP
+record. Each finalized denial attempts one canonical `blocked` emission before
+reply delivery or a deliberate silent drop. Sink delivery remains best effort.
+
+Local blocked logging also records pre-authentication listener refusals, one
+record per refusal when `logging.include_blocked` is enabled (the default).
+Before exposing a listener with local blocked logging enabled, configure log
+rotation by size or time and retention in the log collector. Alert on sustained
+increases in `mcp_protocol` events with reason `MCP listener admission refused`
+and on log storage approaching the collector's configured capacity. Set
+thresholds from the deployment's normal request rate and storage budget. External sink queues are bounded and may drop events under
+load. Operators who need only external blocked events can disable
+`logging.include_blocked`; this does not disable external emission.
+
+`protocol: mcp`, `transport`, and `direction` identify the trusted MCP route,
+including CEE events. HTTP events retain their existing field set. MCP `resource` values follow these contracts. Existing content-bearing
+resources retain audit redaction; route fields do not make their content safe.
+
+| Denial surface | Serialized `resource` |
+|---|---|
+| Tool inventory scanning (`tool_scanning`) | `[redacted]` |
+| Frozen tool inventory (`frozen_tool`) | Refused tool name, or `invalid-mcp-resource` when omitted or empty |
+| Response content, provenance, media policy, denial-of-wallet, and CEE | `[redacted]` |
+| Newly logged input failures | `mcp_input` |
+| Listener header failures | `mcp_listener_header` |
+| Newly logged response failures | `mcp_response` |
+| Redirect output failures | `mcp_redirect_output` |
+| Upstream error reply scanning | `upstream_error_reply` |
+| Listener admission and inspection failures | `mcp_listener` |
+| Startup refusals | `mcp_startup` |
+
+Tool inventory blocks preserve the released `tool_scanning` label and `[redacted]` resource. The configuration section remains `mcp_tool_scanning`. Frozen-tool blocks retain the refused tool name. New failure markers omit request arguments, header values, and response bodies. Rules filtering `fields.scanner == "dlp"` for credentials should also
+select `mcp_input_dlp`, `mcp_header_dlp`, and `mcp_redirect_output_dlp` when MCP
+blocks are in scope.
+
 ### Info (sent only when a sink sets `min_severity: info`)
 
 These go to the local log (except the seven events named below when `logging.include_allowed` is `false`), and reach a sink only when that sink's
@@ -225,6 +333,13 @@ Operator lifecycle:
   enforced by an exclusive advisory lock on a `<spool_file>.lock` sidecar — a
   second process pointed at the same spool fails to start delivery rather than
   racing the cursor.
+
+  For two MCP wrappers, use separate config files with stable pairs: set
+  `emit.forwarder.spool_file: /var/lib/pipelock/mcp-calendar.spool` and
+  `emit.forwarder.cursor_file: /var/lib/pipelock/mcp-calendar.cursor` in the
+  calendar wrapper's config, and use `mcp-files.spool` / `mcp-files.cursor`
+  for the files wrapper. Keep each pair across that wrapper's restarts so
+  pending events can replay.
 - Inspect: watch the forwarder metrics and the cursor's offset/hash while
   treating the spool as the delivery source of truth.
 - Rotate: stop Pipelock, confirm the cursor offset equals the spool size,

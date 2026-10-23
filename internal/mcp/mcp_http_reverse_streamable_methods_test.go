@@ -175,6 +175,11 @@ func readStreamableAuditSessions(t *testing.T, path string) []string {
 		if err := json.Unmarshal(line, &entry); err != nil {
 			t.Fatalf("Unmarshal(audit): %v; line=%s", err, line)
 		}
+		// A block event carries the scanner finding, not a session key; the
+		// adaptive events it accompanies are the ones that bind to a session.
+		if _, hasSession := entry["session"]; !hasSession && entry["event"] == "blocked" {
+			continue
+		}
 		sessionValue, ok := entry["session"].(string)
 		if !ok {
 			t.Fatalf("audit session missing or non-string in %s", line)
@@ -336,7 +341,8 @@ func TestHTTPListener_GETStreamBlocksCompressedUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
+	logger, events := newListenerEventLogger(t)
+	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t), AuditLogger: logger})
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, baseURL+"/", nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
@@ -360,6 +366,12 @@ func TestHTTPListener_GETStreamBlocksCompressedUpstream(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte("upstream body must not leak")) {
 		t.Fatalf("compressed upstream body leaked: %s", body)
+	}
+	// The refusal follows a completed upstream exchange, so it is a withheld
+	// response even though no withhold helper wrote it.
+	got := events.String()
+	if strings.Count(got, `"event":"blocked"`) != 1 || !strings.Contains(got, `"direction":"response"`) {
+		t.Fatalf("GET stream refusal lost its response direction: %s", got)
 	}
 }
 
@@ -995,6 +1007,18 @@ func TestHTTPListener_AuditSessionKeySanitizedForAdaptiveSignals(t *testing.T) {
 			}
 			if got := upstreamCalls.Load(); got != afterSetup {
 				t.Fatalf("listener-header DLP block reached upstream: calls = %d, want %d", got, afterSetup)
+			}
+			rawAudit, err := os.ReadFile(filepath.Clean(auditPath))
+			if err != nil {
+				t.Fatalf("ReadFile(audit): %v", err)
+			}
+			if !bytes.Contains(rawAudit, []byte(`"event":"blocked"`)) {
+				t.Fatalf("listener-header DLP block emitted no blocked event: %s", rawAudit)
+			}
+			for _, secret := range []string{dlpToken, rawSessionID, token} {
+				if bytes.Contains(rawAudit, []byte(secret)) {
+					t.Fatalf("audit stream leaked header credential or routing data: %s", rawAudit)
+				}
 			}
 		})
 	}

@@ -851,6 +851,7 @@ func TestForwardScannedInput_BlocksToolCallRedactionFailure(t *testing.T) {
 // tools/call block verdicts. Exercising the FrozenTool path here is
 // representative: all four use the same emitToolReceipt closure.
 func TestForwardScannedInput_FrozenToolBlockEmitsReceipt(t *testing.T) {
+	logger, events := newListenerEventLogger(t)
 	sc := testInputScanner(t)
 	msg := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_command","arguments":{"cmd":"ls"}}}`
 
@@ -860,6 +861,7 @@ func TestForwardScannedInput_FrozenToolBlockEmitsReceipt(t *testing.T) {
 	blockedCh := make(chan BlockedRequest, 1)
 	opts := MCPProxyOpts{
 		Scanner:             sc,
+		AuditLogger:         logger,
 		Transport:           "mcp_stdio",
 		ReceiptEmitter:      emitter,
 		ToolFreezer:         &stubToolFreezer{frozen: true, allowed: map[string]bool{"read_file": true}},
@@ -878,6 +880,9 @@ func TestForwardScannedInput_FrozenToolBlockEmitsReceipt(t *testing.T) {
 		opts,
 	)
 
+	if !strings.Contains(events.String(), `"resource":"exec_command"`) {
+		t.Fatalf("released frozen-tool resource changed: %s", events.String())
+	}
 	blocked, ok := <-blockedCh
 	if !ok {
 		t.Fatal("expected blocked request on frozen-tool path")
@@ -1339,10 +1344,18 @@ func TestForwardScannedInput_ParseErrorBlocked(t *testing.T) {
 
 	var serverIn bytes.Buffer
 	var logW bytes.Buffer
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	blockedCh := make(chan BlockedRequest, 10)
 
 	clientIn := strings.NewReader("not json\n")
-	fwdScannedInput(clientIn, &serverIn, &logW, sc, "block", "block", blockedCh)
+	opts := testOpts(sc)
+	opts.AuditLogger = logger
+	ForwardScannedInput(transport.NewStdioReader(clientIn), transport.NewStdioWriter(&serverIn), &logW, "block", "block", blockedCh, nil, nil, opts)
 
 	// Should NOT be forwarded
 	if serverIn.Len() > 0 {
@@ -1363,6 +1376,11 @@ func TestForwardScannedInput_ParseErrorBlocked(t *testing.T) {
 	}
 	if !gotBlocked {
 		t.Error("expected blocked request for parse error")
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditMCPInputInspection+`"`) ||
+		!strings.Contains(got, `"block_class":"infrastructure_error"`) || strings.Contains(got, "not json") {
+		t.Fatalf("stdio parse denial audit event = %s", got)
 	}
 }
 
@@ -3355,12 +3373,20 @@ func TestForwardScannedInput_SessionBinding_BlockUnknown(t *testing.T) {
 
 	var serverBuf bytes.Buffer
 	var logBuf bytes.Buffer
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	blockedCh := make(chan BlockedRequest, 10)
+	opts := testOpts(sc)
+	opts.AuditLogger = logger
 
 	ForwardScannedInput(
 		transport.NewStdioReader(strings.NewReader(req)),
 		transport.NewStdioWriter(&serverBuf),
-		&logBuf, "warn", "block", blockedCh, bindingCfg, nil, testOpts(sc),
+		&logBuf, "warn", "block", blockedCh, bindingCfg, nil, opts,
 	)
 
 	blocked := make([]BlockedRequest, 0)
@@ -3376,6 +3402,11 @@ func TestForwardScannedInput_SessionBinding_BlockUnknown(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "not in session baseline") {
 		t.Errorf("expected 'not in session baseline' in log, got: %s", logBuf.String())
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditMCPSessionBinding+`"`) ||
+		!strings.Contains(got, "mcp_session_binding.unknown_tool_action") || strings.Contains(got, "exec_command") {
+		t.Fatalf("session binding audit event = %s", got)
 	}
 }
 
@@ -3735,7 +3766,12 @@ func TestForwardScannedInput_ChainDetectionBlock(t *testing.T) {
 
 func TestForwardScannedInput_ChainDetectionBlock_WithAuditLogger(t *testing.T) {
 	sc := testScanner(t)
-	al := audit.NewNop()
+	var events bytes.Buffer
+	al, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(al.Close)
 
 	chainCfg := &config.ToolChainDetection{
 		Enabled:       true,
@@ -3771,6 +3807,11 @@ func TestForwardScannedInput_ChainDetectionBlock_WithAuditLogger(t *testing.T) {
 	}
 	if blocked[0].ErrorCode != -32004 {
 		t.Errorf("expected error code -32004, got %d", blocked[0].ErrorCode)
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditChainDetection+`"`) ||
+		!strings.Contains(got, "tool_chain_detection.pattern_overrides") {
+		t.Fatalf("chain denial audit event = %s", got)
 	}
 }
 

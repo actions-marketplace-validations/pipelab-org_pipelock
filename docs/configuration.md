@@ -1294,6 +1294,24 @@ See [`docs/guides/sse-streaming.md`](guides/sse-streaming.md) for the full guide
 
 Scans JSON-RPC requests from agent to MCP server for DLP leaks and injection in tool arguments.
 
+MCP blocked audit events distinguish `mcp_input_dlp`, `mcp_input_injection`,
+and `mcp_input_inspection`. The first two point to the MCP input controls below;
+inspection failures require correcting the request or scanner state. Tool-policy
+denials use `mcp_tool_policy` and point to the matched `mcp_tool_policy.rules`
+entry. Listener request-header findings use separate `mcp_header_*` labels:
+text DLP checks selected header names and values, while decoded `Mcp-Param-*`
+values also receive response injection scanning. `Last-Event-ID`,
+`Mcp-Param-*`, and `Mcp-Session-Id` are always selected; `Authorization` is
+selected by default. Other selection follows `request_body_scanning.scan_headers`,
+`header_mode`, `sensitive_headers`, and `ignore_headers`, not the MCP input
+action. A failed
+or unparseable MCP response uses `mcp_response_inspection` and an operational
+`block_class`; these events do not report an attack technique.
+Malformed upstream responses are blocked and classified as operational even when a raw fallback detects instruction-like content, matching the input inspection-failure rule.
+Tool-definition blocks preserve the released `tool_scanning` audit label and `[redacted]` resource; an inventory capacity or
+inspection refusal has an operational `block_class` and cannot be relaxed by
+`mcp_tool_scanning.action`.
+
 ```yaml
 mcp_input_scanning:
   enabled: true
@@ -2425,6 +2443,21 @@ emit:
 | `otlp.queue_size` | `256` | Async buffer size (overflow = drop) |
 | `otlp.gzip` | `false` | Compress request bodies with gzip |
 
+MCP proxy input DLP and injection blocks emit `blocked` events. Response scan
+blocks emit `blocked`; response strip and warn decisions emit `response_scan`.
+These events use scanner pattern names or fixed block reasons, without matched
+request or response text. They apply to subprocess, HTTP upstream, WebSocket
+upstream, and HTTP listener modes, including `run --mcp-listen`. In listener
+modes this includes credential or injection findings in request headers and
+upstream HTTP error replies withheld by response scanning.
+
+Each `pipelock mcp proxy` process builds its sinks from `emit` once at startup
+(it does not hot-reload) and refuses to start if a configured sink cannot be
+created or activated. Every wrapper process has its own sinks, so a destination
+that allows only one writer cannot be shared: the Enterprise `emit.forwarder`
+takes an exclusive lock on its `spool_file`, and a second process pointed at the
+same spool, such as another wrapped MCP server or `pipelock run`, fails to start.
+
 OTLP events are sent as log records over HTTP/protobuf. Each pipelock audit event maps to one OTLP LogRecord with `service.name=pipelock` as a resource attribute. Retries on 429, 502, 503, 504, and network errors with bounded exponential backoff (3 attempts, 1s/2s/4s). 500 and 501 are not retried. No gRPC, no batching timer.
 
 **Severity levels** (hardcoded per event type, not configurable):
@@ -2471,12 +2504,14 @@ Coverage by transport:
 | WebSocket (`/ws`) | Yes, from the upgrade request, on every event for that connection including frame scans and close |
 | CONNECT with TLS interception | Yes. Each inner request uses its own header value; when an inner request has none, the CONNECT request's value is used. Tunnel-level events use the CONNECT request's value. |
 | CONNECT passthrough (no interception) | Only from headers on the CONNECT request itself (for example `curl --proxy-header`). Headers inside the encrypted tunnel are not visible. |
-| MCP HTTP listener (`--listen`) | Yes, per HTTP request, including SSE responses to that request |
+| MCP HTTP listener (`--listen`) | Yes, after the correlation header is vetted, including SSE responses to that request. Earlier refusals omit it; see the known gaps below. |
 | MCP stdio, MCP to an HTTP or WebSocket upstream from stdio | No. There are no inbound request headers, so the field is absent. |
 
-Allow and block decisions carry the field on every transport listed above. On fetch, WebSocket, TLS-intercepted requests, and the MCP HTTP listener, the request's session-level events (such as `session_anomaly` and adaptive escalation) carry it too; on the forward proxy, CONNECT, and reverse proxy paths those session-level events do not. Warn-mode DLP findings (`dlp_warn`) do not carry it on any transport. Events not tied to a request, such as startup and config reload, never carry it.
+Allow and block decisions carry the field on the transports marked Yes above, subject to the known gaps below. On fetch, WebSocket, TLS-intercepted requests, and the MCP HTTP listener, the request's session-level events (such as `session_anomaly` and adaptive escalation) carry it too; on the forward proxy, CONNECT, and reverse proxy paths those session-level events do not. Warn-mode DLP findings (`dlp_warn`) do not carry it on any transport. Events not tied to a request, such as startup and config reload, never carry it.
 
 Known gaps, where an event for a tagged request has no `correlation_id`:
+
+- MCP HTTP listener refusals before header vetting: Origin, authentication, Host, HTTP method, protocol headers, scanner availability, and server identity checks. These events omit the unvetted client value. Later header-DLP, tool-policy, and response refusals carry the vetted value.
 
 - MCP stdio, and stdio to an HTTP or WebSocket upstream: no inbound request headers exist.
 - CONNECT passthrough: headers inside the encrypted tunnel are not visible.

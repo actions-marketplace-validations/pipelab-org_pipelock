@@ -74,6 +74,17 @@ const (
 // matched rule did not come from a loaded bundle. Callers should pass
 // the build-time-injected Pipelock version (cliutil.Version).
 func agentThreatDetectionAttrs(event Event, binaryVersion string) []*commonpb.KeyValue {
+	// MCP operational refusals are not observed agent threats. HTTP and
+	// forward-proxy blocks retain their existing convention projection even
+	// when the audit logger classifies them as protective or operational.
+	// The protocol field comes from the typed MCP audit context, including CEE.
+	protocol, _ := event.Fields["protocol"].(string)
+	if protocol == "mcp" {
+		if class, _ := event.Fields["block_class"].(string); class != "" && class != "threat" {
+			return nil
+		}
+	}
+
 	action, ok := mapConventionAction(event)
 	if !ok {
 		return nil

@@ -10,6 +10,26 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
+func TestMCPHeaderGuidanceNamesActualScanControls(t *testing.T) {
+	dlp, ok := guidanceForResult(AuditMCPHeaderDLP, "test credential")
+	if !ok {
+		t.Fatal("MCP header DLP guidance missing")
+	}
+	for _, want := range []string{
+		"listener request header", "text DLP", "Authorization", "Last-Event-ID", "Mcp-Param-*", "Mcp-Session-Id",
+		"request_body_scanning.scan_headers", "header_mode", "sensitive_headers", "ignore_headers",
+	} {
+		if !strings.Contains(dlp.OperatorKnob, want) {
+			t.Errorf("MCP header DLP guidance omitted %q: %s", want, dlp.OperatorKnob)
+		}
+	}
+	injection, ok := guidanceForResult(AuditMCPHeaderInjection, "test instruction")
+	if !ok || !strings.Contains(injection.OperatorKnob, "decoded Mcp-Param-*") ||
+		!strings.Contains(injection.OperatorKnob, "response injection scanning") {
+		t.Fatalf("MCP header injection guidance describes the wrong scan: %+v", injection)
+	}
+}
+
 func TestGuidanceForResultPatternNameEndingInValidityNote(t *testing.T) {
 	for _, note := range []string{githubDownloadGrantValidityNote, githubDownloadSASValidityNote, githubAttestationValidityNote, githubActionsValidityNote} {
 		t.Run(note, func(t *testing.T) {
@@ -115,12 +135,29 @@ func TestRemediationGuidanceCoversAllLabels(t *testing.T) {
 		AuditSessionAnomaly,
 		AuditAdaptiveEnforcement,
 		AuditMCPSessionBinding,
+		AuditMCPToolPolicy,
+		ScannerMCPToolScanning,
+		AuditToolScanning,
+		AuditMCPInputDLP,
+		AuditMCPInputInjection,
+		AuditMCPInputInspection,
+		AuditMCPHeaderDLP,
+		AuditMCPHeaderInjection,
+		AuditMCPHeaderInspection,
+		AuditMCPResponseInspection,
+		AuditMCPProtocol,
+		AuditMCPRedirect,
+		AuditMCPRedirectOutputDLP,
+		AuditMCPRedirectOutputInjection,
+		AuditMCPDefer,
 		AuditFrozenTool,
 		AuditSNIMismatch,
 		AuditKillSwitch,
 		AuditAirlock,
 		AuditCrossRequestEntropy,
 		AuditCrossRequestFragment,
+		AuditCrossRequestFragmentOwnerMismatch,
+		AuditCrossRequestFragmentCapacity,
 		AuditGitProtection,
 		AuditAgentBudget,
 		AuditResponseSize,
@@ -455,6 +492,8 @@ func TestOperatorHintForResultResolvesAuditReasons(t *testing.T) {
 		{"baseline deviation", AuditSessionAnomaly, "baseline_deviation", "pipelock baseline show"},
 		{"domain burst", AuditSessionAnomaly, "ip_domain_burst", "session_profiling.domain_burst"},
 		{"frozen tool is airlock", AuditFrozenTool, "tool not in frozen inventory", "airlock.timers"},
+		{"released tool scanning inspection", AuditToolScanning, "tools/list cannot be safely inspected: tool_inventory_capacity", "does not override this refusal"},
+		{"URL tool scanning inspection", ScannerMCPToolScanning, "tools/list cannot be safely inspected: tool_inventory_capacity", "does not override this refusal"},
 		{"session deny alias", AuditSessionDeny, "critical", "affected identity session"},
 		{"A2A header alias", AuditA2AHeader, "a2a: A2A-Extensions header contains blocked URI", "a2a_scanning.action"},
 		{"redaction non JSON route", AuditRedaction, "redaction blocked request: non_json_body", "redaction.allowlist_unparseable_routes"},
@@ -817,6 +856,7 @@ func TestJSONInspectionRemediationReasonFormats(t *testing.T) {
 		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (escalated)"},
 		{ScannerDLP, "DLP: " + UninspectableJSONNumberPattern},
 		{AuditCrossRequestFragment, "fragment reassembly DLP match: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "cross-request fragment inspection limit exceeded"},
 		{AuditCrossRequestFragment, "cross-request fragment refused: " + UninspectableJSONNumberPattern + "; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)"},
 		{AuditA2AResponse, "a2a: DLP: " + UninspectableJSONNumberPattern},
 		{AuditA2AResponse, "a2a: 2 URL/SSRF finding(s); injection: ordinary; DLP: " + UninspectableJSONNumberPattern},
@@ -857,6 +897,7 @@ func TestJSONInspectionRemediationIgnoresBlankPatterns(t *testing.T) {
 		{ScannerCoreDLP, "core DLP match: " + UninspectableJSONNumberPattern + " (high)"},
 		{AuditA2AResponse, "a2a: DLP: " + UninspectableJSONNumberPattern},
 		{AuditCrossRequestFragment, "fragment reassembly DLP match: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "cross-request fragment inspection limit exceeded"},
 	} {
 		t.Run(tt.label, func(t *testing.T) {
 			// Positive control: this genuine reason must be recognized on its own.
@@ -904,5 +945,62 @@ func TestA2AJSONInspectionRemediationRejectsForgedParts(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// The mcp_protocol label covers listener admission, protocol and capacity
+// refusals as well as batches. Only a batch request is repaired by sending one
+// request at a time, so no other reason may carry that hint.
+func TestMCPProtocolHintOnlyForBatchRequests(t *testing.T) {
+	const batchKnob = "Send one JSON-RPC request at a time."
+	if hint := OperatorHintForResult(AuditMCPProtocol, "MCP batch requests are unsupported"); !strings.Contains(hint, batchKnob) {
+		t.Fatalf("batch request hint = %q", hint)
+	}
+	for _, reason := range []string{
+		"MCP batch responses are unsupported",
+		"MCP listener admission refused",
+		"MCP listener protocol refused",
+		"MCP listener state capacity exhausted",
+		"session capacity exhausted; release active quarantine or increase max_sessions",
+	} {
+		if hint := OperatorHintForResult(AuditMCPProtocol, reason); hint == "" || strings.Contains(hint, batchKnob) {
+			t.Errorf("reason %q has hint %q, want its own non-empty hint", reason, hint)
+		}
+	}
+}
+
+// Operational refusals must identify the failed prerequisite, rather than
+// recommending the generic content-policy controls for the same label.
+func TestMCPRemediationReasonPrerequisites(t *testing.T) {
+	cases := []struct {
+		label, reason, want string
+		immutable           bool
+	}{
+		{AuditContract, "MCP contract evaluation failed", "Restore the active contract loader", false},
+		{AuditA2AScan, "A2A input could not be inspected", "does not override a failed inspection", false},
+		{AuditA2AScan, "A2A input URL check refused", "cloud metadata and core-critical destination blocks remain enforced", false},
+		{AuditA2AScan, "A2A input inspection budget exceeded", "budget-only refusal after fallback scanning", false},
+		{AuditA2AScan, "A2A input configuration mismatch", "does not repair a configuration mismatch", false},
+		{AuditMCPProtocol, "MCP batch responses are unsupported", "correct the upstream server", true},
+		{AuditMCPProtocol, "MCP listener admission refused", "listener_require_state_token", true},
+		{AuditMCPProtocol, "MCP listener protocol refused", "no scanner or policy setting relaxes protocol validation", true},
+		{AuditMCPProtocol, "MCP listener state capacity exhausted", "Retry after an existing state expires", true},
+		{AuditMCPProtocol, "session capacity exhausted; release active quarantine or increase max_sessions", "session_profiling.max_sessions", true},
+		{ScannerMCPToolScanning, "tools/list cannot be safely inspected: oversized inventory", "does not override this refusal", false},
+		{AuditToolScanning, "tools/list cannot be safely inspected: malformed inventory", "does not override this refusal", false},
+		{AuditResponseScan, "response scan parse error in MCP parameter header", "cannot make the header scannable", false},
+		{AuditResponseScan, "response scan cannot be scanned: response scanner unavailable", "policy suppression cannot provide the missing scan", false},
+		{AuditResponseScan, "response scan returned an incomplete verdict", "a pattern suppression has no identified match to change", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label+"/"+tc.reason, func(t *testing.T) {
+			guidance, ok := GuidanceForResult(tc.label, tc.reason)
+			if !ok || !strings.Contains(guidance.OperatorKnob, tc.want) || guidance.Immutable != tc.immutable || guidance.AgentReason != auditRuntimeAgentReason {
+				t.Fatalf("guidance = %+v, ok=%v; want prerequisite %q, immutable=%v and runtime refusal", guidance, ok, tc.want, tc.immutable)
+			}
+			if hint := OperatorHintForResult(tc.label, tc.reason); !strings.Contains(hint, tc.want) {
+				t.Fatalf("operator hint lost prerequisite: %q", hint)
+			}
+		})
 	}
 }

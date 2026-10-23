@@ -44,6 +44,17 @@ func TestTechniqueForScanner_AllMappedEntries(t *testing.T) {
 		// Command/scripting interpreter
 		{"response_scan", "T1059"},
 		{"policy", "T1059"},
+		{"mcp_input_dlp", "T1048"},
+		{"mcp_input_injection", "T1059"},
+		{"mcp_header_dlp", "T1048"},
+		{"mcp_header_injection", "T1059"},
+		{"mcp_tool_scanning", "T1195.002"},
+		{"context", "T1190"},
+		{"core_dlp", "T1048"},
+		{"core_ssrf", "T1046"},
+		{"core_response", "T1059"},
+		{"mcp_redirect_output_dlp", "T1048"},
+		{"mcp_redirect_output_injection", "T1059"},
 
 		// WebSocket transport
 		{"ws_protocol", "T1071"},
@@ -53,6 +64,7 @@ func TestTechniqueForScanner_AllMappedEntries(t *testing.T) {
 
 		// Supply chain
 		{"mcp_unknown_tool", "T1195.002"},
+		{"tool_scanning", "T1195.002"},
 
 		// Session anomaly
 		{"session_anomaly", "T1078"},
@@ -79,7 +91,15 @@ func TestTechniqueForScanner_AllMappedEntries(t *testing.T) {
 		{"persist", "T1053"},
 	}
 
+	if len(tests) != len(techniqueMap) {
+		t.Fatalf("mapping expectations = %d, registered entries = %d", len(tests), len(techniqueMap))
+	}
+	seen := make(map[string]bool)
 	for _, tt := range tests {
+		if seen[tt.scanner] {
+			t.Fatalf("duplicate mapping expectation %q", tt.scanner)
+		}
+		seen[tt.scanner] = true
 		t.Run(tt.scanner, func(t *testing.T) {
 			got := TechniqueForScanner(tt.scanner)
 			if got != tt.technique {
@@ -122,6 +142,9 @@ func TestTechniqueForScanner_UnknownReturnsEmpty(t *testing.T) {
 		"config_reload",
 		"startup",
 		"readability",
+		"mcp_protocol",
+		"mcp_redirect",
+		"mcp_defer",
 	}
 
 	for _, scanner := range unknowns {
@@ -148,7 +171,7 @@ func TestTechniqueMap_NoDuplicateKeys(t *testing.T) {
 	// This test is a compile-time guarantee in Go (duplicate map keys are a
 	// compile error), but we verify the map has the expected number of entries
 	// to catch accidental deletions during refactoring.
-	const expectedEntries = 36
+	const expectedEntries = 44
 	if len(techniqueMap) != expectedEntries {
 		t.Errorf("techniqueMap has %d entries, expected %d (was an entry added or removed?)", len(techniqueMap), expectedEntries)
 	}

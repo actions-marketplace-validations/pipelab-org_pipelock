@@ -70,6 +70,17 @@ func IsContentScanner(name string) bool {
 
 func redactedContentFields(ctx LogContext, scanner string) (loggedURL, loggedTarget, loggedResource string) {
 	loggedResource = ctx.resource
+	// The MCP denial finalizer selects these literal protocol markers from its
+	// catalog. Preserve only those, never an argument, resource URI, or tool
+	// name: an unsigned tool named like a marker keeps its released content
+	// redaction because its producer supplied the context. DoW resources stay
+	// redacted under every descriptor, as released.
+	if ctx.mcpMarker && scanner != scannerpkg.ScannerDenialOfWallet {
+		switch ctx.resource {
+		case "mcp_input", "mcp_listener_header", "mcp_response", "mcp_redirect_output", "upstream_error_reply", "mcp_listener", "mcp_startup":
+			return redactContentBearingURL(ctx.url), redactContentBearingURL(ctx.target), ctx.resource
+		}
+	}
 	switch scannerContentFieldMode(scanner) {
 	case contentFieldModeDestination:
 		return dropURLContentSegments(ctx.url, false),
