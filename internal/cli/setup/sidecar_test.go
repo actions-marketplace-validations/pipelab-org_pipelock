@@ -6,10 +6,16 @@ package setup
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/luckyPipewrench/pipelock/internal/cli/presets"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -880,6 +886,290 @@ func TestMCPUpstreamHostHasMalformedPort(t *testing.T) {
 	for host, want := range cases {
 		if got := mcpUpstreamHostHasMalformedPort(host); got != want {
 			t.Errorf("mcpUpstreamHostHasMalformedPort(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestRunSidecar_EmittedProxyState(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{"patch", "kustomize", "helm-values"} {
+		t.Run(format, func(t *testing.T) {
+			output := filepath.Join(t.TempDir(), "bundle")
+			var buf bytes.Buffer
+			cmd := SidecarCmd()
+			cmd.SetOut(&buf)
+			cmd.SetErr(&buf)
+			cmd.SetArgs([]string{"--inject-spec", testdataPath(t, "deployment.yaml"), "--emit", format, "--output", output, "--skip-canary"})
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("emit: %v: %s", err, buf.String())
+			}
+			var data []byte
+			var err error
+			switch format {
+			case "patch":
+				data, err = os.ReadFile(filepath.Clean(output))
+			case "kustomize":
+				data, err = os.ReadFile(filepath.Clean(filepath.Join(output, "pipelock-deployment.yaml")))
+			case "helm-values":
+				_, lookupErr := exec.LookPath("helm")
+				if lookupErr != nil {
+					t.Skip("Helm unavailable; chart policy checks cover rendering")
+				}
+				// #nosec G204 -- fixed chart and generated values in a private t.TempDir.
+				data, err = exec.CommandContext(t.Context(), "helm", "template", "pipelock", "../../../charts/pipelock", "-f", filepath.Join(output, "values.yaml")).CombinedOutput()
+				if err != nil {
+					t.Fatalf("helm render: %v: %s", err, data)
+				}
+				// The chart supplies its default state home through a ConfigMap
+				// so later operator envFrom sources retain their precedence.
+				rendered := filepath.Join(output, "rendered.yaml")
+				if err := os.WriteFile(rendered, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// #nosec G204 -- fixed validation chart and private generated input.
+				checked, err := exec.CommandContext(t.Context(), "helm", "template", "state-check", "../../../scripts/helmstate", "--set-file", "manifests.emitted="+rendered).CombinedOutput()
+				if err != nil || !bytes.Contains(checked, []byte("decoded Helm proxy state checks passed")) {
+					t.Fatalf("decoded Helm state checks: %v: %s", err, checked)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("read/render: %v: %s", err, data)
+			}
+			decoder := yaml.NewDecoder(bytes.NewReader(data))
+			proxies := 0
+			for {
+				var doc map[string]interface{}
+				if err := decoder.Decode(&doc); errors.Is(err, io.EOF) {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if doc["kind"] != kindDeployment {
+					continue
+				}
+				pod, err := getPodSpec(doc, kindDeployment)
+				if err != nil {
+					t.Fatal(err)
+				}
+				containers := pod["containers"].([]interface{})
+				c := containers[0].(map[string]interface{})
+				if c["name"] == proxyContainerName {
+					encoded, err := yaml.Marshal(doc)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !deploymentHasProxyState(string(encoded)) {
+						t.Fatalf("emitted proxy lacks writable state: %s", encoded)
+					}
+					proxies++
+				} else {
+					for _, entry := range containers {
+						agent := entry.(map[string]interface{})
+						env, _ := agent["env"].([]interface{})
+						for _, variable := range env {
+							if variable.(map[string]interface{})["name"] == envXDGStateHome {
+								t.Fatal("state home leaked into agent")
+							}
+						}
+					}
+				}
+			}
+			if proxies != 1 {
+				t.Fatalf("got %d proxy Deployments, want 1", proxies)
+			}
+		})
+	}
+}
+
+func TestRunSidecar_RegeneratePatchedOutput(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{emitPatch, emitKustomize, emitHelmValues} {
+		t.Run(format, func(t *testing.T) {
+			dir := t.TempDir()
+			output := filepath.Join(dir, "output")
+			run := func(input string, flags ...string) (sidecarResult, string, error) {
+				t.Helper()
+				var buf bytes.Buffer
+				cmd := SidecarCmd()
+				cmd.SetOut(&buf)
+				cmd.SetErr(&buf)
+				args := []string{"--inject-spec", input, "--emit", format, "--output", output, "--skip-canary", "--json"}
+				cmd.SetArgs(append(args, flags...))
+				err := cmd.Execute()
+				var result sidecarResult
+				if err == nil {
+					if decodeErr := json.Unmarshal(buf.Bytes(), &result); decodeErr != nil {
+						t.Fatalf("decode result: %v: %s", decodeErr, buf.String())
+					}
+				}
+				return result, buf.String(), err
+			}
+			original := testdataPath(t, "deployment.yaml")
+			first, detail, err := run(original)
+			if err != nil || !first.Patch.Written || first.Verify.Healthy != (format != emitHelmValues) || first.Verify.Skipped != (format == emitHelmValues) {
+				t.Fatalf("first run: %v: %s", err, detail)
+			}
+			companion := output
+			agent := output
+			if format != emitPatch {
+				agent = filepath.Join(output, "agent-workload.yaml")
+				companion = filepath.Join(output, "pipelock-deployment.yaml")
+				if format == emitHelmValues {
+					companion = filepath.Join(output, "values.yaml")
+				}
+			}
+			generated, err := os.ReadFile(filepath.Clean(companion))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Keep patched input separate even for the single-file bundle.
+			patched, err := os.ReadFile(filepath.Clean(agent))
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := filepath.Join(dir, "patched-input.yaml")
+			if err := os.WriteFile(input, patched, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			manual := []byte("# operator-edited companion; do not overwrite without --force\n")
+			if err := os.WriteFile(filepath.Clean(companion), manual, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			assertPreserved := func() {
+				t.Helper()
+				got, err := os.ReadFile(filepath.Clean(companion))
+				if err != nil || !bytes.Equal(got, manual) {
+					t.Fatalf("manual output changed without forced emission: %v: %s", err, got)
+				}
+			}
+			if _, _, err := run(original); err == nil {
+				t.Fatal("existing output from original input must require --force")
+			}
+			assertPreserved()
+			skipped, detail, err := run(input)
+			if err != nil || skipped.Patch.Written || !skipped.Verify.Skipped || skipped.Verify.Healthy || !strings.Contains(skipped.Verify.Detail, "existing files were not verified") {
+				t.Fatalf("unforced patched run must not claim verification: %v: %s", err, detail)
+			}
+			assertPreserved()
+			dry, detail, err := run(input, "--force", "--dry-run")
+			if err != nil || dry.Patch.Written || !dry.Verify.Skipped || dry.Verify.Healthy {
+				t.Fatalf("dry run: %v: %s", err, detail)
+			}
+			assertPreserved()
+			for range 2 {
+				forced, detail, err := run(input, "--force")
+				if err != nil || !forced.Patch.Written || forced.Verify.Healthy != (format != emitHelmValues) || forced.Verify.Skipped != (format == emitHelmValues) || !forced.Detect.AlreadyPatched {
+					t.Fatalf("forced patched run: %v: %s", err, detail)
+				}
+				got, err := os.ReadFile(filepath.Clean(companion))
+				if err != nil || !bytes.Equal(got, generated) {
+					t.Fatalf("forced output differs from first run: %v: %s", err, got)
+				}
+			}
+			// A patched input alone is no evidence that the requested output exists.
+			output = filepath.Join(dir, "never-emitted")
+			missing, detail, err := run(input)
+			if err != nil || missing.Patch.Written || !missing.Verify.Skipped || missing.Verify.Healthy {
+				t.Fatalf("unwritten output must not be verified: %v: %s", err, detail)
+			}
+			if _, err := os.Stat(output); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("skipped run created output: %v", err)
+			}
+		})
+	}
+}
+
+func TestPrintSidecarSummary_HelmNextSteps(t *testing.T) {
+	t.Parallel()
+	for _, outputPath := range []string{"bundle", ""} {
+		t.Run("output="+outputPath, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			result := &sidecarResult{Detect: &sidecarDetectResult{}, Patch: &sidecarPatchSummary{}}
+			result.Patch.EmitFormat = emitHelmValues
+			result.Patch.OutputPath = outputPath
+			printSidecarSummary(&buf, result, sidecarOptions{})
+			bundle := outputPath
+			if bundle == "" {
+				bundle = "<bundle-dir>"
+			}
+			for _, want := range []string{
+				"render and inspect first: see " + bundle + "/README.txt",
+				"oci://ghcr.io/luckypipewrench/charts/pipelock --version <chart-version> -f " + bundle + "/values.yaml",
+			} {
+				if !strings.Contains(buf.String(), want) {
+					t.Errorf("summary missing %q: %s", want, &buf)
+				}
+			}
+			if strings.Contains(buf.String(), " pipelock/pipelock ") {
+				t.Errorf("summary uses unpublished chart alias: %s", &buf)
+			}
+		})
+	}
+}
+
+func TestRunSidecar_VerificationOutputFormats(t *testing.T) {
+	t.Parallel()
+	for _, format := range []string{emitPatch, emitKustomize, emitHelmValues} {
+		for _, jsonOutput := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/json=%t", format, jsonOutput), func(t *testing.T) {
+				t.Parallel()
+				output := filepath.Join(t.TempDir(), "bundle")
+				var buf bytes.Buffer
+				cmd := SidecarCmd()
+				cmd.SetOut(&buf)
+				cmd.SetErr(&buf)
+				args := []string{"--inject-spec", testdataPath(t, "deployment.yaml"), "--emit", format, "--output", output}
+				if jsonOutput {
+					args = append(args, "--json")
+				}
+				cmd.SetArgs(args)
+				if err := cmd.Execute(); err != nil {
+					t.Fatalf("execute: %v: %s", err, &buf)
+				}
+				helm := format == emitHelmValues
+				if jsonOutput {
+					var result sidecarResult
+					if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+						t.Fatal(err)
+					}
+					if result.Verify == nil || result.Verify.Skipped != helm || result.Verify.Healthy == helm || result.Verify.Reachable == helm {
+						t.Fatalf("verify: %+v", result.Verify)
+					}
+					if result.Canary == nil || result.Canary.Skipped || !result.Canary.Detected {
+						t.Fatalf("canary must still run: %+v", result.Canary)
+					}
+				} else {
+					want := "Verify:          healthy"
+					if helm {
+						want = "Verify:          skipped"
+						if !strings.Contains(buf.String(), "not rendered or deployed") || strings.Contains(buf.String(), "Static topology checks passed") {
+							t.Fatalf("chart boundary missing: %s", &buf)
+						}
+					}
+					if !strings.Contains(buf.String(), want) || !strings.Contains(buf.String(), "Canary:          detected") {
+						t.Fatalf("summary: %s", &buf)
+					}
+				}
+				if helm {
+					readme, err := os.ReadFile(filepath.Clean(filepath.Join(output, "README.txt")))
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, want := range []string{"not rendered or deployed", "helm show chart", "helm template", "--version \"$chart_version\"", "Inspect rendered.yaml"} {
+						if !bytes.Contains(readme, []byte(want)) {
+							t.Fatalf("README missing %q: %s", want, readme)
+						}
+					}
+					// The chart is published only as an OCI artifact: every Helm command
+					// must name that reference, and a repo search cannot list it.
+					const ociChart = "oci://ghcr.io/luckypipewrench/charts/pipelock"
+					if got := bytes.Count(readme, []byte(ociChart)); got != 3 || bytes.Contains(readme, []byte("helm search repo")) || bytes.Contains(readme, []byte(" pipelock/pipelock ")) {
+						t.Fatalf("README must use the OCI chart reference in show, template and install (found %d): %s", got, readme)
+					}
+				}
+			})
 		}
 	}
 }

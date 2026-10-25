@@ -34,29 +34,35 @@ func runSidecarVerify(w io.Writer, result *sidecarPatchResult, opts sidecarOptio
 	if result.ProxyName == "" || result.ProxyURL == "" {
 		failed = append(failed, "proxy identity metadata is incomplete")
 	}
-	if result.DeploymentYAML == "" {
-		failed = append(failed, "proxy Deployment YAML is empty")
-	}
-	if result.ServiceYAML == "" {
-		failed = append(failed, "proxy Service YAML is empty")
+	// Helm values do not emit a Deployment or Service; the selected chart owns them.
+	if opts.emit != emitHelmValues {
+		if result.DeploymentYAML == "" {
+			failed = append(failed, "proxy Deployment YAML is empty")
+		}
+		if !deploymentHasProxyState(result.DeploymentYAML) {
+			failed = append(failed, "proxy Deployment is missing writable proxy-only state")
+		}
+		if result.ServiceYAML == "" {
+			failed = append(failed, "proxy Service YAML is empty")
+		}
+		if !strings.Contains(result.DeploymentYAML, fmt.Sprintf("replicas: %d", proxyReplicaCount)) {
+			failed = append(failed, fmt.Sprintf("proxy Deployment does not set replicas=%d", proxyReplicaCount))
+		}
+		if got, ok := deploymentTerminationGrace(result.DeploymentYAML); !ok || got != proxyTerminationGracePeriodSeconds {
+			failed = append(failed, fmt.Sprintf("proxy Deployment does not set terminationGracePeriodSeconds=%d", proxyTerminationGracePeriodSeconds))
+		}
+		if strings.Contains(result.DeploymentYAML, "subPath:") {
+			failed = append(failed, "proxy Deployment still uses subPath ConfigMap mount")
+		}
+		if !strings.Contains(result.DeploymentYAML, "mountPath: /etc/pipelock") {
+			failed = append(failed, "proxy Deployment does not mount the config directory")
+		}
+		if !strings.Contains(result.DeploymentYAML, "imagePullPolicy: IfNotPresent") {
+			failed = append(failed, "proxy Deployment does not set imagePullPolicy=IfNotPresent")
+		}
 	}
 	if result.PodDisruptionBudgetYAML == "" {
 		failed = append(failed, "proxy PodDisruptionBudget YAML is empty")
-	}
-	if !strings.Contains(result.DeploymentYAML, fmt.Sprintf("replicas: %d", proxyReplicaCount)) {
-		failed = append(failed, fmt.Sprintf("proxy Deployment does not set replicas=%d", proxyReplicaCount))
-	}
-	if got, ok := deploymentTerminationGrace(result.DeploymentYAML); !ok || got != proxyTerminationGracePeriodSeconds {
-		failed = append(failed, fmt.Sprintf("proxy Deployment does not set terminationGracePeriodSeconds=%d", proxyTerminationGracePeriodSeconds))
-	}
-	if strings.Contains(result.DeploymentYAML, "subPath:") {
-		failed = append(failed, "proxy Deployment still uses subPath ConfigMap mount")
-	}
-	if !strings.Contains(result.DeploymentYAML, "mountPath: /etc/pipelock") {
-		failed = append(failed, "proxy Deployment does not mount the config directory")
-	}
-	if !strings.Contains(result.DeploymentYAML, "imagePullPolicy: IfNotPresent") {
-		failed = append(failed, "proxy Deployment does not set imagePullPolicy=IfNotPresent")
 	}
 	if !result.Config.ForwardProxy.Enabled {
 		failed = append(failed, "forward_proxy.enabled is false")
@@ -99,6 +105,13 @@ func runSidecarVerify(w io.Writer, result *sidecarPatchResult, opts sidecarOptio
 	}
 
 	if len(failed) == 0 {
+		if opts.emit == emitHelmValues {
+			detail := "skipped (Helm chart topology was not rendered or deployed); generated config and emitted policy checks passed; render and inspect the selected chart version before applying"
+			if !jsonOutput {
+				_, _ = fmt.Fprintln(w, "  "+detail)
+			}
+			return &sidecarVerifyResult{Skipped: true, Detail: detail}
+		}
 		if !jsonOutput {
 			_, _ = fmt.Fprintln(w, "  Static topology checks passed.")
 			_, _ = fmt.Fprintf(w, "  Agent egress is limited to DNS + %s.\n", result.ProxyName)
@@ -265,4 +278,65 @@ func deploymentTerminationGrace(manifest string) (int64, bool) {
 		return 0, false
 	}
 	return *grace, true
+}
+
+// deploymentHasProxyState checks the linked state environment, mount and volume
+// on the companion proxy, with the group that makes emptyDir writable non-root.
+func deploymentHasProxyState(manifest string) bool {
+	var doc map[string]interface{}
+	if err := yaml.Unmarshal([]byte(manifest), &doc); err != nil {
+		return false
+	}
+	pod, err := getPodSpec(doc, kindDeployment)
+	if err != nil {
+		return false
+	}
+	security, _ := pod["securityContext"].(map[string]interface{})
+	if security["fsGroup"] != proxyRunAsUser {
+		return false
+	}
+	volumes, _ := pod["volumes"].([]interface{})
+	stateVolumes := 0
+	for _, entry := range volumes {
+		volume, _ := entry.(map[string]interface{})
+		if volume["name"] == proxyStateVolume {
+			empty, ok := volume["emptyDir"].(map[string]interface{})
+			if !ok || len(empty) != 0 || len(volume) != 2 {
+				return false
+			}
+			stateVolumes++
+		}
+	}
+	containers, _ := pod["containers"].([]interface{})
+	if stateVolumes != 1 || len(containers) != 1 {
+		return false
+	}
+	container, _ := containers[0].(map[string]interface{})
+	if container["name"] != proxyContainerName {
+		return false
+	}
+	env, _ := container["env"].([]interface{})
+	stateEnvs := 0
+	for _, entry := range env {
+		variable, _ := entry.(map[string]interface{})
+		if variable["name"] == envXDGStateHome {
+			if variable["value"] != proxyStateHome || variable["valueFrom"] != nil {
+				return false
+			}
+			stateEnvs++
+		}
+	}
+	mounts, _ := container["volumeMounts"].([]interface{})
+	stateMounts := 0
+	for _, entry := range mounts {
+		mount, _ := entry.(map[string]interface{})
+		if mount["name"] == proxyStateVolume || mount["mountPath"] == proxyStateHome {
+			if mount["name"] != proxyStateVolume || mount["mountPath"] != proxyStateHome ||
+				mount["readOnly"] == true || mount["subPath"] != nil || mount["subPathExpr"] != nil {
+				return false
+			}
+			stateMounts++
+		}
+	}
+	return stateEnvs == 1 && stateMounts == 1
 }

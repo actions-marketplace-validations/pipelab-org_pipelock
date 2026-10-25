@@ -560,6 +560,18 @@ func (e *Emitter) TailObservation() (TailObservation, error) {
 	return obs, nil
 }
 
+// ConfirmedTailObservation waits for outstanding emission confirmations before
+// observing the tail. It releases the emission gate before returning; callers
+// must not hold up writers while reading or publishing the observed prefix.
+func (e *Emitter) ConfirmedTailObservation() (TailObservation, error) {
+	if e == nil {
+		return TailObservation{}, errors.New("receipt emitter unavailable")
+	}
+	e.emissionGate.Lock()
+	defer e.emissionGate.Unlock()
+	return e.TailObservation()
+}
+
 // Session returns the recorder session this emitter records under. Nil-safe.
 func (e *Emitter) Session() string {
 	if e == nil {
@@ -580,6 +592,8 @@ func (e *Emitter) SignerKeyHex() string {
 
 // EmitOpts holds the per-decision context for emitting a receipt.
 type EmitOpts struct {
+	promptInjectionModeSet bool
+	promptInjectionMode    string
 	// ShardIndex is selected once at admission and copied into later outcome,
 	// failure-marker, and v2 emissions. It is runtime-only, never signed JSON.
 	ShardIndex            int

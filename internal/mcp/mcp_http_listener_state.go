@@ -47,9 +47,13 @@ type mcpListenerClientState struct {
 	lastActive   time.Time
 	inFlight     atomic.Int64
 	commitMu     sync.Mutex
-	revoked      atomic.Bool
-	done         context.Context
-	cancel       context.CancelFunc
+	// Serialize inventories of every protocol version across upstream fetch,
+	// scan and delivery; modern calls share the read lock only while selecting
+	// and checking a contract, so a long call cannot stall a queued list.
+	contractMu contractLock
+	revoked    atomic.Bool
+	done       context.Context
+	cancel     context.CancelFunc
 }
 
 // mcpListenerPrincipal is an authenticated security identity, not MCP routing

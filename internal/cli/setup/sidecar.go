@@ -100,7 +100,7 @@ Examples:
 	cmd.Flags().StringVar(&opts.emit, "emit", emitPatch, "output format: patch, kustomize, helm-values")
 	cmd.Flags().StringVarP(&opts.output, "output", "o", "", "output path (default: stdout)")
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "show diff without writing files or running canary")
-	cmd.Flags().BoolVar(&opts.force, "force", false, "overwrite existing output files")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "regenerate output even from a patched manifest and overwrite existing output files")
 	cmd.Flags().StringVar(&opts.image, "image", "", "companion proxy image (default: ghcr.io/luckypipewrench/pipelock:<version>)")
 	cmd.Flags().StringVar(&opts.preset, "preset", config.ModeBalanced, presets.FlagHelp)
 	cmd.Flags().BoolVar(&opts.skipCanary, "skip-canary", false, "skip the canary detection test")
@@ -155,6 +155,7 @@ func runSidecar(cmd *cobra.Command, opts sidecarOptions) error {
 
 	alreadyPatched := hasPipelockTopology(manifest.Raw)
 	mcpContractChanged := alreadyPatched && sidecarMCPContractChanged(manifest.Raw, opts)
+	regenerate := !alreadyPatched || mcpContractChanged || opts.force
 
 	result.Detect = &sidecarDetectResult{
 		Kind:           manifest.Kind,
@@ -200,7 +201,7 @@ func runSidecar(cmd *cobra.Command, opts sidecarOptions) error {
 	// Phase 3: Preview
 	if !opts.jsonOutput {
 		_, _ = fmt.Fprintln(w, "[3/7] Diff preview:")
-		if alreadyPatched && !mcpContractChanged {
+		if !regenerate {
 			_, _ = fmt.Fprintln(w, "  No changes (manifest already patched).")
 		} else {
 			diff, err := renderDiff(manifest, patchResult)
@@ -233,10 +234,10 @@ func runSidecar(cmd *cobra.Command, opts sidecarOptions) error {
 		if !opts.jsonOutput {
 			_, _ = fmt.Fprintf(w, "  Dry run: would emit %s format\n\n", opts.emit)
 		}
-	} else if alreadyPatched && !mcpContractChanged {
+	} else if !regenerate {
 		patchSummary.Written = false
 		if !opts.jsonOutput {
-			_, _ = fmt.Fprintln(w, "  Skipped: manifest already patched.")
+			_, _ = fmt.Fprintln(w, "  Skipped: manifest already patched. Use --force to regenerate the companion output.")
 		}
 	} else {
 		if opts.jsonOutput && opts.output == "" {
@@ -268,7 +269,14 @@ func runSidecar(cmd *cobra.Command, opts sidecarOptions) error {
 			_, _ = fmt.Fprintln(w, "  Skipped (--dry-run)")
 		}
 	} else {
-		result.Verify = runSidecarVerify(w, patchResult, opts, opts.jsonOutput)
+		if !patchSummary.Written {
+			result.Verify = &sidecarVerifyResult{Skipped: true, Detail: "skipped (no output emitted; existing files were not verified); use --force to regenerate"}
+			if !opts.jsonOutput {
+				_, _ = fmt.Fprintln(w, "  Skipped: no output emitted; existing files were not verified. Use --force to regenerate.")
+			}
+		} else {
+			result.Verify = runSidecarVerify(w, patchResult, opts, opts.jsonOutput)
+		}
 		if !opts.jsonOutput {
 			_, _ = fmt.Fprintln(w)
 		}
@@ -613,13 +621,15 @@ func printSidecarSummary(w io.Writer, result *sidecarResult, opts sidecarOptions
 		}
 	case emitHelmValues:
 		if result.Patch.OutputPath != "" {
-			_, _ = fmt.Fprintf(w, "  helm upgrade --install <release-name> pipelock/pipelock -f %s/values.yaml\n", result.Patch.OutputPath)
+			_, _ = fmt.Fprintf(w, "  # render and inspect first: see %s/README.txt\n", result.Patch.OutputPath)
+			_, _ = fmt.Fprintf(w, "  helm upgrade --install <release-name> oci://ghcr.io/luckypipewrench/charts/pipelock --version <chart-version> -f %s/values.yaml\n", result.Patch.OutputPath)
 			_, _ = fmt.Fprintln(w, "  kubectl rollout status deployment/<release-name>")
 			_, _ = fmt.Fprintf(w, "  kubectl apply -f %s/pipelock-networkpolicy.yaml -f %s/pipelock-pdb.yaml\n", result.Patch.OutputPath, result.Patch.OutputPath)
 			_, _ = fmt.Fprintf(w, "  kubectl apply -f %s/agent-networkpolicy.yaml\n", result.Patch.OutputPath)
 			_, _ = fmt.Fprintf(w, "  kubectl apply -f %s/agent-workload.yaml\n", result.Patch.OutputPath)
 		} else {
-			_, _ = fmt.Fprintln(w, "  helm upgrade --install <release-name> pipelock/pipelock -f <bundle-dir>/values.yaml")
+			_, _ = fmt.Fprintln(w, "  # render and inspect first: see <bundle-dir>/README.txt")
+			_, _ = fmt.Fprintln(w, "  helm upgrade --install <release-name> oci://ghcr.io/luckypipewrench/charts/pipelock --version <chart-version> -f <bundle-dir>/values.yaml")
 		}
 	default:
 		_, _ = fmt.Fprintln(w, "  kubectl apply -f <patched-manifest>")

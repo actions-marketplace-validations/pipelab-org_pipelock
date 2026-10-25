@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -133,6 +134,11 @@ func (o MCPProxyOpts) minSubjectTrust() config.DoWSubjectTrust {
 // Optional (nil-safe): all other fields - functions check before use.
 type MCPProxyOpts struct {
 	denialTerminal *mcpDeferredTerminal
+	// Modern HTTP lists enforce structural contracts independently of drift trust.
+	validateToolHeaders bool
+	// JSON listener scanning writes to a buffer. Defer inventory admission until
+	// the real downstream write succeeds; streaming transports commit directly.
+	toolInventoryDelivery func(commit, release func())
 	// OnResponseKeysValidated admits transport metadata only after message keys
 	// pass the shared guard. It must be set before response scanning starts.
 	OnResponseKeysValidated func()
@@ -176,8 +182,11 @@ type MCPProxyOpts struct {
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Scanning
-	Scanner        *scanner.Scanner
-	ScannerFn      func() *scanner.Scanner
+	Scanner   *scanner.Scanner
+	ScannerFn func() *scanner.Scanner
+	// ReloadMu is the publisher's lock, shared with config/scanner reloads.
+	// Request snapshots hold it only while resolving the scanner and policy hash.
+	ReloadMu       *sync.RWMutex
 	Approver       *hitl.Approver
 	InputCfg       *InputScanConfig
 	InputCfgFn     func() *InputScanConfig
@@ -219,7 +228,8 @@ type MCPProxyOpts struct {
 	TaintExternalSource bool
 	// TaintTrustedSource marks this MCP server's responses as operator-trusted
 	// for taint classification. Prompt-injection hits can still raise hostile
-	// taint; this only changes clean response-source classification.
+	// taint unless prompt_injection_detection is off or warn-only; this only
+	// changes clean response-source classification.
 	TaintTrustedSource bool
 	// TaintTrustedSourceFn returns the current MCP taint trust decision for
 	// hot-reload-aware proxy surfaces. Nil falls back to TaintTrustedSource.
@@ -668,6 +678,24 @@ func (o MCPProxyOpts) warnContext() context.Context {
 	return context.Background()
 }
 
+// snapshotScanPolicy pins the scanner and its receipt policy to the same
+// reload revision. Copies retain the snapshot through input, response and
+// asynchronous receipt emission; other live resolvers keep their own semantics.
+func (o MCPProxyOpts) snapshotScanPolicy() MCPProxyOpts {
+	if o.ReloadMu != nil {
+		o.ReloadMu.RLock()
+		defer o.ReloadMu.RUnlock()
+	}
+	o.Scanner = o.scanner()
+	o.PolicyHash = o.receiptPolicyHash()
+	o.ScannerFn = nil
+	o.PolicyHashFn = nil
+	o.ConfigHash = o.captureConfigHash()
+	o.ConfigHashFn = nil
+	o.ReloadMu = nil
+	return o
+}
+
 func (o MCPProxyOpts) scanner() *scanner.Scanner {
 	if o.ScannerFn != nil {
 		return o.ScannerFn()
@@ -837,6 +865,7 @@ func (o MCPProxyOpts) v2ReceiptEmitter() *proxydecision.Emitter {
 }
 
 func (o MCPProxyOpts) emitReceiptDecision(d MCPDecision) ([]byte, error) {
+	d.Receipt = o.withReceiptPolicyHash(d.Receipt)
 	if o.ReceiptGroup != nil {
 		if o.ReceiptGroup.Shards != nil && d.Receipt.ActionID != "" && !d.Receipt.ShardSelected {
 			d.Receipt = o.ReceiptGroup.Shards.Admit(d.Receipt)
@@ -863,10 +892,11 @@ func (o MCPProxyOpts) receiptPolicyHash() string {
 }
 
 func (o MCPProxyOpts) withReceiptPolicyHash(opts receipt.EmitOpts) receipt.EmitOpts {
+	o = o.snapshotScanPolicy()
 	if opts.PolicyHash == "" {
 		opts.PolicyHash = o.receiptPolicyHash()
 	}
-	return opts
+	return receipt.WithPromptInjectionMode(opts, o.scanner().PromptInjectionMode())
 }
 
 func (o MCPProxyOpts) deferManager() *deferred.Manager {

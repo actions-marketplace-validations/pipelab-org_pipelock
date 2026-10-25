@@ -4,7 +4,6 @@
 package session
 
 import (
-	"encoding/json"
 	"maps"
 	"net"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
 	"github.com/luckyPipewrench/pipelock/internal/normalize"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
@@ -182,6 +182,16 @@ func ClassifyMCPToolCallWithOptions(toolName, argsJSON string, protectedPatterns
 		targets.urls = compactNonEmpty(legacyURL)
 	}
 	pathClass := classifyMCPPathTargets(targets.refs, legacyPath, protectedPatterns, elevatedPatterns, opts)
+	if !parsed && argsJSON != "" {
+		// Retain fallback references for compatibility, but unparsed arguments
+		// cannot establish that a write target is outside protected paths.
+		// Empty input is excluded: the MCP frame parser normalizes absent and
+		// null arguments to "", which names no target, exactly like {}. Both
+		// stay under fail_safe_classification rather than splitting one
+		// request's outcome by wire spelling.
+		pathClass.Sensitivity = SensitivityProtected
+		pathClass.Confident = false
+	}
 	targetPath := pathClass.ActionRef
 	targetURL := compatibleFirstTarget(targets.urls, legacyURL)
 	category := chains.ClassifyTool(toolName, argsJSON, nil)
@@ -200,6 +210,13 @@ func ClassifyMCPToolCallWithOptions(toolName, argsJSON string, protectedPatterns
 
 	if category == "persist" {
 		return ActionClassification{Class: ActionClassExec, Sensitivity: SensitivityProtected, ActionRef: targetPath, OverrideRefs: targets.refs, Confident: true}
+	}
+
+	// Unparsed arguments carry no trustworthy intent, so a write-named tool
+	// keeps its protected, low-confidence write classification instead of
+	// being reclassified from raw-text matches below.
+	if !parsed && argsJSON != "" && (looksLikeWriteTool(name) || category == "write") {
+		return ActionClassification{Class: ActionClassWrite, Sensitivity: pathClass.Sensitivity, ActionRef: pathClass.ActionRef, OverrideRefs: pathClass.OverrideRefs, Confident: false}
 	}
 
 	// Explicit network mutation intent must retain publication protection even
@@ -659,8 +676,8 @@ func flattenJSONStrings(raw string) []string {
 	if raw == "" {
 		return nil
 	}
-	var decoded any
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+	decoded, ok := decodeJSONValue(raw)
+	if !ok {
 		return []string{raw}
 	}
 	var out []string
@@ -846,7 +863,7 @@ func decodeJSONValue(raw string) (any, bool) {
 		return nil, false
 	}
 	var decoded any
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+	if err := extract.DecodeJSON([]byte(raw), &decoded); err != nil {
 		return nil, false
 	}
 	return decoded, true

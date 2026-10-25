@@ -146,6 +146,7 @@ func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
 		Version:    cliutil.Version,
 	}
 	report.Checks = []doctorReportCheck{
+		checkDoctorPromptInjectionDetection(cfg),
 		checkDoctorHTTPProxy(cfg),
 		checkDoctorTLSInterception(cfg),
 		checkDoctorTLSInterceptionCoverage(cfg),
@@ -178,6 +179,16 @@ func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
 		})
 	}
 	report.Checks = append(report.Checks, checkDoctorConfigSemantics(cfg)...)
+	for _, diagnostic := range cfg.MCPTaintDiagnostics() {
+		surface := doctorSurfaceMCP
+		if diagnostic.Field == "taint.mcp_recorder" {
+			surface = doctorSurfaceConfig
+		}
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name: diagnostic.Field, Surface: surface, Status: doctorStatusInfo,
+			Configured: cfg.Taint.Enabled, Detail: diagnostic.Message,
+		})
+	}
 	report.Checks = append(report.Checks, checkDoctorAvailableKnobs(cfg)...)
 	report.Summary = retallyDoctorSummary(report.Checks)
 	return report

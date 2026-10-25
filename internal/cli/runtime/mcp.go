@@ -490,6 +490,21 @@ func recoverDeferredActions(
 	if err != nil {
 		return fmt.Errorf("reading deferred action journal: %w", err)
 	}
+	// Validate every saved selection before closing any hold. A restart must
+	// not assign an unresolved action to a different receipt shard.
+	if receiptGroup != nil && receiptGroup.Shards != nil {
+		for _, held := range pending {
+			if !held.ShardSelected {
+				return fmt.Errorf("deferred restart recovery %q has no recorded receipt shard; start once with flight_recorder.receipt_chains set to 1 to close it, and preserve journal %q and its receipt evidence: %w", held.DeferID, journalPath, mcp.ErrReceiptRequired)
+			}
+			if held.ShardIndex < 0 {
+				return fmt.Errorf("deferred restart recovery %q has invalid saved receipt shard %d; preserve journal %q and its receipt evidence for recovery: %w", held.DeferID, held.ShardIndex, journalPath, mcp.ErrReceiptRequired)
+			}
+			if held.ShardIndex >= receiptGroup.Shards.ShardCount() {
+				return fmt.Errorf("deferred restart recovery %q needs saved receipt shard %d, unavailable in the configured group of %d; set flight_recorder.receipt_chains to at least %d and preserve journal %q: %w", held.DeferID, held.ShardIndex, receiptGroup.Shards.ShardCount(), held.ShardIndex+1, journalPath, mcp.ErrReceiptRequired)
+			}
+		}
+	}
 	sort.Slice(pending, func(i, j int) bool {
 		if pending[i].CascadeDepth != pending[j].CascadeDepth {
 			return pending[i].CascadeDepth < pending[j].CascadeDepth
@@ -508,6 +523,8 @@ func recoverDeferredActions(
 		if err := mcp.EmitDeferredResolutionReceipt(opts, logW, deferred.Resolution{
 			DeferID:          held.DeferID,
 			ParentActionID:   held.ActionID,
+			ShardIndex:       held.ShardIndex,
+			ShardSelected:    held.ShardSelected,
 			FinalDecision:    config.ActionBlock,
 			ResolutionSource: deferred.SourceRestartRecovery,
 			Authority:        held.Authority,
@@ -659,7 +676,9 @@ tool-definition poisoning/drift) is detected, and 2 if any line could not be
 fully inspected and was therefore not verified clean - including a tools/list
 response scanned while mcp_tool_scanning is explicitly disabled by config; a
 verdict never reports clean:true over content it did not inspect. A finding
-outranks an inspection failure. Scanning covers response injection, inbound
+outranks an inspection failure. A strict-mode rule-bundle integrity refusal
+also exits with code 1 before stdin is read and produces no response verdict.
+Scanning covers response injection, inbound
 DLP, and (auto-enabled by default, like the proxy) tool-definition scanning
 for tools/list responses. It does not include tool call policy or request-side
 input scanning, because scan only ever sees one side of the conversation: the
@@ -699,6 +718,9 @@ Examples:
 			for _, w := range bundleResult.Warnings {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
 			}
+			if err := strictRuleBundleIntegrityError(cfg, bundleResult); err != nil {
+				return err
+			}
 			if bundleResult.Degraded {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
 			}
@@ -707,6 +729,8 @@ Examples:
 				return fmt.Errorf("create scanner: %w", err)
 			}
 			defer sc.Close()
+			announcePromptInjectionPolicy(cfg, nil, cmd.ErrOrStderr())
+			wirePromptInjectionStderr(sc, cmd.ErrOrStderr())
 
 			// A nil toolCfg tells ScanStreamResult the operator explicitly
 			// disabled mcp_tool_scanning (RuntimeMCPScan auto-enables it
@@ -1038,15 +1062,15 @@ Key-free evidence capture:
 			for _, w := range bundleResult.Warnings {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
 			}
-			if bundleResult.Degraded {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
-			}
 			// Fail closed in strict mode on installed-bundle integrity loss,
 			// matching the main proxy server's startup path. Without this a
 			// strict `mcp proxy` would silently boot on core patterns only when
 			// a tampered bundle failed verification.
 			if err := strictRuleBundleIntegrityError(cfg, bundleResult); err != nil {
 				return err
+			}
+			if bundleResult.Degraded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
 			}
 			extraPoison := rules.ConvertToolPoison(bundleResult.ToolPoison)
 
@@ -1093,6 +1117,8 @@ Key-free evidence capture:
 				return fmt.Errorf("create MCP audit logger: %w", err)
 			}
 			defer auditLogger.Close()
+			wirePromptInjectionAudit(sc, auditLogger)
+			announcePromptInjectionPolicy(cfg, auditLogger, cmd.ErrOrStderr())
 			upstreamDialContext := verifiedDialContext(
 				mcp.NewMetadataSafeDialContext(func() *scanner.Scanner { return sc }),
 				launchIdentity,

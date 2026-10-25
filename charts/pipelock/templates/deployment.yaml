@@ -1,5 +1,6 @@
 {{- include "pipelock.validate" . }}
 {{- if eq (include "pipelock.mode" .) "proxy" }}
+{{- $defaultStateHome := eq (include "pipelock.defaultStateHome" .) "true" }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -125,15 +126,25 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
-          {{- with .Values.extraEnvFrom }}
+          {{- if or $defaultStateHome .Values.extraEnvFrom }}
           envFrom:
+            {{- if $defaultStateHome }}
+            - configMapRef:
+                name: {{ include "pipelock.fullname" . }}-state-env
+            {{- end }}
+            {{- with .Values.extraEnvFrom }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
+            {{- if $defaultStateHome }}
+            - name: pipelock-state
+              mountPath: /var/lib/pipelock/home
+            {{- end }}
             - name: config
               mountPath: /etc/pipelock
             {{- if and .Values.license.enabled .Values.license.existingSecret }}
@@ -178,6 +189,10 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
       volumes:
+        {{- if $defaultStateHome }}
+        - name: pipelock-state
+          emptyDir: {}
+        {{- end }}
         - name: config
           configMap:
             name: {{ include "pipelock.fullname" . }}

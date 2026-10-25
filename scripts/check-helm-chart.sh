@@ -18,6 +18,86 @@ for values in "$chart"/examples/*.yaml; do
   helm template pipelock "$chart" -f "$values" >"$render_dir/$name.yaml"
 done
 
+# Existing manual state homes replace the default wiring, without duplicate
+# environment names, mount paths, or volume names. Reuse the default volume name
+# here to ensure the default volume is omitted as well as its mount.
+cat >"$render_dir/custom-state-values.yaml" <<'EOF'
+extraEnv:
+  - name: XDG_STATE_HOME
+    value: /custom/state
+extraVolumes:
+  - name: pipelock-state
+    persistentVolumeClaim:
+      claimName: existing-state
+extraVolumeMounts:
+  - name: pipelock-state
+    mountPath: /custom/state
+extraEnvFrom:
+  - configMapRef:
+      name: state-from-envfrom
+  - secretRef:
+      name: state-from-secret
+EOF
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" >"$render_dir/custom-state.yaml"
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+  --set-json 'extraEnv=[{"name":"XDG_STATE_HOME","valueFrom":{"configMapKeyRef":{"name":"state-home","key":"path"}}}]' \
+  >"$render_dir/custom-state-valuefrom.yaml"
+# HOME is the lower-priority selector; explicit HOME also owns its storage.
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+  --set-json 'extraEnv=[{"name":"HOME","value":"/custom/home"}]' \
+  --set-json 'extraVolumeMounts=[{"name":"pipelock-state","mountPath":"/custom/home/.local/state"}]' \
+  >"$render_dir/custom-state-home.yaml"
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+  --set-json 'extraEnv=[{"name":"HOME","valueFrom":{"configMapKeyRef":{"name":"state-home","key":"path"}}}]' \
+  --set-json 'extraVolumeMounts=[{"name":"pipelock-state","mountPath":"/custom/home/.local/state"}]' \
+  >"$render_dir/custom-state-home-valuefrom.yaml"
+for selector in XDG_STATE_HOME HOME; do
+  name=custom-state-secret-valuefrom
+  state_path=/custom/state
+  if [[ "$selector" == HOME ]]; then
+    name=custom-state-home-secret-valuefrom
+    state_path=/custom/home/.local/state
+  fi
+  helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+    --set-json "extraEnv=[{\"name\":\"$selector\",\"valueFrom\":{\"secretKeyRef\":{\"name\":\"state-home\",\"key\":\"path\"}}}]" \
+    --set-json "extraVolumeMounts=[{\"name\":\"pipelock-state\",\"mountPath\":\"$state_path\"}]" \
+    >"$render_dir/$name.yaml"
+done
+# A default envFrom source must precede operator ConfigMaps and Secrets.
+# Keep existing operator storage even though the harmless default remains.
+helm template pipelock "$chart" \
+  --set-json 'extraEnvFrom=[{"configMapRef":{"name":"state-from-envfrom"}},{"secretRef":{"name":"state-from-secret"}}]' \
+  --set-json 'extraVolumes=[{"name":"operator-state","persistentVolumeClaim":{"claimName":"operator-state"}}]' \
+  --set-json 'extraVolumeMounts=[{"name":"operator-state","mountPath":"/operator/state"}]' \
+  >"$render_dir/envfrom-state.yaml"
+helm template pipelock "$chart" \
+  --set-json 'extraEnvFrom=[{"configMapRef":{"name":"unrelated-env"}}]' \
+  >"$render_dir/unrelated-envfrom.yaml"
+# A follower without persistence still configures durable state paths under
+# /var/lib/pipelock. The default state mount must not make them writable.
+helm template pipelock "$chart" \
+  --set conductorFollower.enabled=true \
+  --set conductorFollower.conductorURL=https://conductor.example:8895 \
+  --set conductorFollower.serverCASecretRef.name=ca \
+  --set conductorFollower.clientSecretRef.name=client \
+  --set conductorFollower.trustRosterSecretRef.name=roster \
+  --set conductorFollower.auditQueueKeyringSecretRef.name=keyring \
+  >"$render_dir/follower-nopersist.yaml"
+# Helm's own YAML decoder checks actual producer output. The Helm-only CI job
+# needs neither a Go toolchain nor an additional YAML package.
+state_args=()
+for manifest in "$render_dir/default.yaml" "$render_dir"/values-*.yaml \
+  "$render_dir/custom-state.yaml" "$render_dir/custom-state-valuefrom.yaml" \
+  "$render_dir/custom-state-home.yaml" "$render_dir/custom-state-home-valuefrom.yaml" \
+  "$render_dir/custom-state-secret-valuefrom.yaml" "$render_dir/custom-state-home-secret-valuefrom.yaml" \
+  "$render_dir/envfrom-state.yaml" "$render_dir/unrelated-envfrom.yaml" \
+  "$render_dir/follower-nopersist.yaml"; do
+  state_args+=(--set-file "manifests.$(basename "$manifest" .yaml)=$manifest")
+done
+helm template state-check scripts/helmstate "${state_args[@]}" >"$render_dir/state-check.out"
+# A checker that renders nothing exits 0, so require its pass marker.
+grep -q -- "decoded Helm proxy state checks passed" "$render_dir/state-check.out"
+
 expect_template_error() {
   local want="$1"
   shift
@@ -32,6 +112,13 @@ expect_template_error() {
     exit 1
   fi
 }
+
+expect_template_error "extraVolumes name pipelock-state conflicts" \
+  --set-json 'extraVolumes=[{"name":"pipelock-state","emptyDir":{}}]'
+expect_template_error "extraVolumeMounts conflicts" \
+  --set-json 'extraVolumeMounts=[{"name":"pipelock-state","mountPath":"/other"}]'
+expect_template_error "extraVolumeMounts conflicts" \
+  --set-json 'extraVolumeMounts=[{"name":"other","mountPath":"/var/lib/pipelock/home"}]'
 
 expect_template_error "/image/tag" \
   --set image.tag="@sha256:e8e249d2dd1b579f995f0f5a75cfab13fb8505a8ffc33c2cec7a6418290d9098"

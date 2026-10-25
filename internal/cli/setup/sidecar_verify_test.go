@@ -399,3 +399,128 @@ func containsFailure(failed []string, want string) bool {
 	}
 	return false
 }
+
+func TestProxyStateContract(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		mutate func(map[string]interface{}, map[string]interface{})
+	}{
+		{"valid", func(_, _ map[string]interface{}) {}},
+		{"missing group", func(pod, _ map[string]interface{}) {
+			delete(pod["securityContext"].(map[string]interface{}), "fsGroup")
+		}},
+		{"wrong group", func(pod, _ map[string]interface{}) { pod["securityContext"].(map[string]interface{})["fsGroup"] = 1 }},
+		{"missing volume", func(pod, _ map[string]interface{}) { delete(pod, "volumes") }},
+		{"wrong volume source", func(pod, _ map[string]interface{}) {
+			pod["volumes"].([]interface{})[0].(map[string]interface{})["emptyDir"] = "invalid"
+		}},
+		{"duplicate volume", func(pod, _ map[string]interface{}) {
+			pod["volumes"] = append(pod["volumes"].([]interface{}), pod["volumes"].([]interface{})[0])
+		}},
+		{"wrong container", func(_, c map[string]interface{}) { c["name"] = "agent" }},
+		{"env from source", func(_, c map[string]interface{}) {
+			c["env"].([]interface{})[0].(map[string]interface{})["valueFrom"] = map[string]interface{}{}
+		}},
+		{"missing env", func(_, c map[string]interface{}) { delete(c, "env") }},
+		{"wrong home", func(_, c map[string]interface{}) {
+			c["env"].([]interface{})[0].(map[string]interface{})["value"] = "/elsewhere"
+		}},
+		{"duplicate env", func(_, c map[string]interface{}) {
+			c["env"] = append(c["env"].([]interface{}), c["env"].([]interface{})[0])
+		}},
+		{"missing mount", func(_, c map[string]interface{}) { delete(c, "volumeMounts") }},
+		{"read only mount", func(_, c map[string]interface{}) {
+			c["volumeMounts"].([]interface{})[0].(map[string]interface{})["readOnly"] = true
+		}},
+		{"wrong mount path", func(_, c map[string]interface{}) {
+			c["volumeMounts"].([]interface{})[0].(map[string]interface{})["mountPath"] = "/elsewhere"
+		}},
+		{"subpath mount", func(_, c map[string]interface{}) {
+			c["volumeMounts"].([]interface{})[0].(map[string]interface{})["subPath"] = "nested"
+		}},
+		{"subpath expression mount", func(_, c map[string]interface{}) {
+			c["volumeMounts"].([]interface{})[0].(map[string]interface{})["subPathExpr"] = "$(POD_NAME)"
+		}},
+		{"foreign mount at state path", func(_, c map[string]interface{}) {
+			c["volumeMounts"] = append(c["volumeMounts"].([]interface{}), map[string]interface{}{"name": "other", "mountPath": proxyStateHome})
+		}},
+		{"memory backed state", func(pod, _ map[string]interface{}) {
+			pod["volumes"].([]interface{})[0].(map[string]interface{})["emptyDir"] = map[string]interface{}{"medium": "Memory"}
+		}},
+		{"second volume source", func(pod, _ map[string]interface{}) {
+			pod["volumes"].([]interface{})[0].(map[string]interface{})["hostPath"] = map[string]interface{}{"path": "/tmp"}
+		}},
+		{"other container", func(pod, c map[string]interface{}) { pod["containers"] = append(pod["containers"].([]interface{}), c) }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := mustPatchResult(t, sidecarOptions{preset: config.ModeBalanced})
+			doc := decodeSidecarVerifyYAML(t, result.DeploymentYAML)
+			pod, err := getPodSpec(doc, kindDeployment)
+			if err != nil {
+				t.Fatal(err)
+			}
+			container := pod["containers"].([]interface{})[0].(map[string]interface{})
+			security := container["securityContext"].(map[string]interface{})
+			if security["readOnlyRootFilesystem"] != true || security["runAsNonRoot"] != true || security["runAsUser"] != 65534 || security["allowPrivilegeEscalation"] != false {
+				t.Fatalf("proxy security changed: %v", security)
+			}
+			tt.mutate(pod, container)
+			result.DeploymentYAML = encodeSidecarVerifyYAML(t, doc)
+			verification := runSidecarVerify(&bytes.Buffer{}, result, sidecarOptions{}, true)
+			if want := tt.name == "valid"; verification.Healthy != want {
+				t.Fatalf("healthy = %v, want %v: %s", verification.Healthy, want, verification.Detail)
+			}
+		})
+	}
+	if deploymentHasProxyState("[") || deploymentHasProxyState("kind: Deployment") {
+		t.Fatal("invalid deployment passed state check")
+	}
+}
+
+func TestRunSidecarVerify_HelmValuesBoundary(t *testing.T) {
+	t.Parallel()
+	for _, jsonOutput := range []bool{false, true} {
+		t.Run(fmt.Sprintf("json=%t", jsonOutput), func(t *testing.T) {
+			t.Parallel()
+			result := mustPatchResult(t, sidecarOptions{preset: config.ModeBalanced, mcpUpstream: "http://tools.vendor.example:3000/mcp"})
+			// These resources are chart-owned and are not emitted by helm-values.
+			result.DeploymentYAML = ""
+			result.ServiceYAML = ""
+			var output bytes.Buffer
+			verify := runSidecarVerify(&output, result, sidecarOptions{emit: emitHelmValues}, jsonOutput)
+			if !verify.Skipped || verify.Healthy || verify.Reachable || !strings.Contains(verify.Detail, "not rendered or deployed") || !strings.Contains(verify.Detail, "emitted policy checks passed") {
+				t.Fatalf("unrendered chart must remain unknown: %+v", verify)
+			}
+			if jsonOutput && output.Len() != 0 {
+				t.Fatalf("JSON mode leaked text: %s", &output)
+			}
+			if !jsonOutput && (!strings.Contains(output.String(), "not rendered or deployed") || strings.Contains(output.String(), "Static topology checks passed")) {
+				t.Fatalf("text must explain the chart boundary: %s", &output)
+			}
+		})
+	}
+	for _, failure := range []string{"config", "agent policy", "proxy policy", "pdb", "mcp"} {
+		t.Run(failure, func(t *testing.T) {
+			t.Parallel()
+			result := mustPatchResult(t, sidecarOptions{preset: config.ModeBalanced, mcpUpstream: "http://tools.vendor.example:3000/mcp"})
+			switch failure {
+			case "config":
+				result.Config.ForwardProxy.Enabled = false
+			case "agent policy":
+				result.AgentNetworkPolicyYAML = ""
+			case "proxy policy":
+				result.ProxyNetworkPolicyYAML = ""
+			case "pdb":
+				result.PodDisruptionBudgetYAML = ""
+			case "mcp":
+				result.MCPConfigMapYAML = ""
+			}
+			verify := runSidecarVerify(&bytes.Buffer{}, result, sidecarOptions{emit: emitHelmValues}, true)
+			if verify.Skipped || verify.Healthy || verify.Reachable || !strings.Contains(verify.Detail, "verification failed") {
+				t.Fatalf("invalid emitted artifact must fail: %+v", verify)
+			}
+		})
+	}
+}

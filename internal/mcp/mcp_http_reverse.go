@@ -255,6 +255,7 @@ func RunHTTPListenerProxy(
 	baseOpts := MCPProxyOpts{
 		Scanner:                   opts.scanner(),
 		ScannerFn:                 opts.ScannerFn,
+		ReloadMu:                  opts.ReloadMu,
 		Approver:                  opts.Approver,
 		InputCfg:                  opts.inputCfg(),
 		InputCfgFn:                opts.InputCfgFn,
@@ -550,7 +551,8 @@ func RunHTTPListenerProxy(
 		// Resolve adaptive config per-request so hot-reloads take effect
 		// without restarting the long-lived listener.
 		adaptiveCfg := opts.adaptiveCfg()
-		reqScanner := baseOpts.scanner()
+		requestBaseOpts := baseOpts.snapshotScanPolicy()
+		reqScanner := requestBaseOpts.scanner()
 		if reqScanner == nil {
 			_, _ = fmt.Fprintf(safeLogW, "pipelock: scanner unavailable\n")
 			denialAudit = mcpOperationalBlockAudit(scanner.AuditScannerUnavailable, "mcp_input", "MCP scanner unavailable")
@@ -563,9 +565,6 @@ func RunHTTPListenerProxy(
 			_, _ = w.Write(resp)
 			return
 		}
-		requestBaseOpts := baseOpts
-		requestBaseOpts.Scanner = reqScanner
-		requestBaseOpts.ScannerFn = nil
 		if opts.ServerIdentityHeadersFn != nil {
 			// Use the same header merger as the actual upstream request. Bind only
 			// operator/client-selected headers, not transport-generated framing.
@@ -1525,13 +1524,54 @@ func RunHTTPListenerProxy(
 			_, _ = w.Write(mismatch)
 			return
 		}
+		releaseContract := func() {}
+		// A wait for the contract lock ends with the request; the client is
+		// gone or the server is stopping, so refuse instead of waiting on.
+		refuseContractWait := func(err error) {
+			_, _ = fmt.Fprintf(safeLogW, "pipelock: request ended while waiting for tool contract state: %v\n", err)
+			denialAudit = mcpListenerCapacityDenialAudit()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write(upstreamErrorResponse(frame.ID, fmt.Errorf("pipelock tool contract state busy")))
+		}
+		// Every list on this principal records header contracts into the same
+		// registry, ordered by reservation. A legacy list reserving inside a
+		// modern list's window would commit first, then discard the modern
+		// contract that is delivered last, so lists of every version serialize.
+		if frame.Method == "tools/list" {
+			if err := clientState.contractMu.Lock(r.Context()); err != nil {
+				refuseContractWait(err)
+				return
+			}
+			releaseContract = sync.OnceFunc(clientState.contractMu.Unlock)
+			defer releaseContract()
+		}
 		if frame.ProtocolVersionPresent && frame.ProtocolVersion >= currentMCPVersion {
+			requestBaseOpts.validateToolHeaders = true
+			switch frame.Method {
+			case methodToolsCall:
+				// Hold the read lock only while choosing the contract. Holding it
+				// through upstream execution would let one long call plus a queued
+				// list (writer preference) stall every call for this principal.
+				if err := clientState.contractMu.RLock(r.Context()); err != nil {
+					refuseContractWait(err)
+					return
+				}
+				releaseContract = sync.OnceFunc(clientState.contractMu.RUnlock)
+				defer releaseContract()
+			}
 			var headerBaseline *tools.ToolBaseline
 			if toolCfg := requestBaseOpts.toolCfg(); toolCfg != nil {
 				headerBaseline = toolCfg.Baseline
 			}
 			if !validateMCPParamHeaders(r.Header, frame, headerBaseline) {
-				_, _ = fmt.Fprintf(safeLogW, "pipelock: MCP parameter header disagrees with accepted tool schema and request body\n")
+				message := "pipelock: MCP parameter header does not match the request body"
+				if mcpToolContractRejected(frame, headerBaseline) {
+					message = "pipelock: tool definition was excluded because its x-mcp-header schema is invalid"
+					_, _ = fmt.Fprintf(safeLogW, "pipelock: call refused for tool %q excluded for an invalid x-mcp-header contract\n", frame.RoutingName)
+				} else {
+					_, _ = fmt.Fprintf(safeLogW, "pipelock: MCP parameter header disagrees with accepted tool schema and request body\n")
+				}
 				w.Header().Set("Content-Type", "application/json")
 				denialAudit = mcpListenerProtocolDenialAudit()
 				w.WriteHeader(http.StatusBadRequest)
@@ -1540,11 +1580,14 @@ func RunHTTPListenerProxy(
 					ID:      frame.ID,
 					Error: rpcErrorDetail{
 						Code:    mcpHeaderMismatchCode,
-						Message: "pipelock: MCP parameter header does not match the request body",
+						Message: message,
 					},
 				})
 				_, _ = w.Write(mismatch)
 				return
+			}
+			if frame.Method == methodToolsCall {
+				releaseContract()
 			}
 		} else if hasMCPParamHeaders(r.Header) {
 			_, _ = fmt.Fprintf(safeLogW, "pipelock: MCP parameter header requires the current protocol version\n")
@@ -2032,14 +2075,23 @@ func RunHTTPListenerProxy(
 			w.Header().Set("Content-Type", "text/event-stream")
 			streamWriter := &sseMessageWriter{
 				w:              w,
-				responseWriter: w,
+				responseWriter: w.ResponseWriter,
 				writeTimeout:   listenerDownstreamWriteTimeout,
 			}
 			if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 				streamWriter.flusher = flusher
 			}
+			reqOpts.toolInventoryDelivery = func(commit, release func()) {
+				if !clientState.commitIfActive(commit) {
+					release()
+				}
+				// A completed tools/list must not hold up calls while an SSE stream
+				// remains open for subsequent notifications.
+				releaseContract()
+			}
 			revocableWriter := &listenerStateMessageWriter{state: clientState, writer: streamWriter, opts: reqOpts}
-			foundInjection, scanErr := ForwardScanned(reader, revocableWriter, safeLogW, responseTracker, reqOpts)
+			streamReader := &requestDoneReader{MessageReader: reader, tracker: responseTracker, release: releaseContract}
+			foundInjection, scanErr := ForwardScanned(streamReader, revocableWriter, safeLogW, responseTracker, reqOpts)
 			if scanErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: scan error: %v\n", scanErr)
 			}
@@ -2084,6 +2136,47 @@ func RunHTTPListenerProxy(
 		var responseTerminal mcpDeferredTerminal
 		reqOpts.denialTerminal = &responseTerminal
 		w.opts.denialTerminal = &responseTerminal
+		var inventoryCommits []func()
+		var inventoryReleases []func()
+		reqOpts.toolInventoryDelivery = func(commit, release func()) {
+			inventoryCommits = append(inventoryCommits, commit)
+			inventoryReleases = append(inventoryReleases, release)
+		}
+		// Current-protocol calls wait on the contract lock, so their lists can
+		// commit after delivery and a failed write never seeds client-seen state.
+		// Legacy calls take no lock: their lists commit once the response is
+		// admitted, just before the write, or a call sent as soon as the client
+		// reads the list would be refused for a missing baseline.
+		commitBeforeWrite := !reqOpts.validateToolHeaders
+		defer func() {
+			for _, release := range inventoryReleases {
+				release()
+			}
+		}()
+		writeOutput := func(output []byte) {
+			withListenerWriteDeadline(w, listenerDownstreamWriteTimeout, func() {
+				w.Header().Set("Content-Type", "application/json")
+				if len(output) == 0 {
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				if commitBeforeWrite {
+					for _, commit := range inventoryCommits {
+						commit()
+					}
+				}
+				n, err := w.Write(output)
+				if err == nil && n == len(output) && !commitBeforeWrite {
+					// net/http buffers small writes. Flush before treating delivery as
+					// successful, so a failed socket write cannot seed client-seen state.
+					if flushErr := http.NewResponseController(w.ResponseWriter).Flush(); flushErr == nil {
+						for _, commit := range inventoryCommits {
+							commit()
+						}
+					}
+				}
+			})
+		}
 		foundInjection, scanErr := ForwardScanned(reader, bufWriter, safeLogW, responseTracker, reqOpts)
 		if scanErr == nil {
 			scanErr = reqOpts.checkServerIdentity()
@@ -2104,14 +2197,7 @@ func RunHTTPListenerProxy(
 		if foundInjection {
 			output := bytes.TrimSpace(buf.Bytes())
 			if !clientState.commitIfActive(func() {
-				withListenerWriteDeadline(w, listenerDownstreamWriteTimeout, func() {
-					w.Header().Set("Content-Type", "application/json")
-					if len(output) == 0 {
-						w.WriteHeader(http.StatusAccepted)
-						return
-					}
-					_, _ = w.Write(output)
-				})
+				writeOutput(output)
 			}) {
 				rejectMissingListenerState(frame.ID)
 			}
@@ -2132,14 +2218,7 @@ func RunHTTPListenerProxy(
 		output := bytes.TrimSpace(buf.Bytes())
 		commitResponse := func() {
 			commitMCPToolCall(baselineRec, mcpFrameBaselineIdentity(frame))
-			withListenerWriteDeadline(w, listenerDownstreamWriteTimeout, func() {
-				w.Header().Set("Content-Type", "application/json")
-				if len(output) == 0 {
-					w.WriteHeader(http.StatusAccepted)
-					return
-				}
-				_, _ = w.Write(output)
-			})
+			writeOutput(output)
 		}
 		if setupState {
 			commitResponse()

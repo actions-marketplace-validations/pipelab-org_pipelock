@@ -156,6 +156,10 @@ type ExtraPoisonPattern struct {
 // Session binding fields are optional: when BindingUnknownAction is non-empty,
 // tools/call requests are validated against the baseline captured from tools/list.
 type ToolScanConfig struct {
+	// RequireHeaderContracts enables modern HTTP structural validation. A
+	// definition excluded for an invalid contract never becomes drift trust;
+	// warned definitions follow the ordinary warn-policy adoption.
+	RequireHeaderContracts bool
 	// Baseline holds the caller-scoped baseline for session binding. It is also
 	// the drift baseline unless DriftBaseline is set.
 	Baseline *ToolBaseline
@@ -267,14 +271,14 @@ func (pre toolPrescan) credentialRequestAttribution() credentialRequestAttributi
 	return attributeWithNorm(pre.text, pre.norm, pre.spans)
 }
 
-func prescanTool(cfg *ToolScanConfig, tool ToolDef) toolPrescan {
+func prescanTool(cfg *ToolScanConfig, tool ToolDef, wording bool) toolPrescan {
 	text, spans := toolScanTextOrdered(tool, cfg.textOrder())
 	pre := toolPrescan{text: text, spans: spans}
 	if text != "" {
 		pre.norm = normalize.ForToolText(text)
-		pre.poison = checkToolPoison(pre.norm)
+		pre.poison = checkToolPoisonWithWording(pre.norm, wording)
 		pre.spacedNorm = normalize.ForToolTextSpaced(text)
-		pre.spacedPoison = spacedOnlyToolPoison(pre.spacedNorm, pre.norm, pre.poison)
+		pre.spacedPoison = spacedOnlyToolPoison(pre.spacedNorm, pre.norm, pre.poison, wording)
 	}
 	return pre
 }
@@ -282,17 +286,17 @@ func prescanTool(cfg *ToolScanConfig, tool ToolDef) toolPrescan {
 // checkSpacedToolPoison returns the tool-poison findings of the spaced view
 // of text that are not already in found, the findings of its stripped view.
 func checkSpacedToolPoison(text, norm string, found []string) []string {
-	return spacedOnlyToolPoison(normalize.ForToolTextSpaced(text), norm, found)
+	return spacedOnlyToolPoison(normalize.ForToolTextSpaced(text), norm, found, true)
 }
 
 // spacedOnlyToolPoison returns the tool-poison findings of spaced, the spaced
 // view, that are not already in found, the findings of norm.
-func spacedOnlyToolPoison(spaced, norm string, found []string) []string {
+func spacedOnlyToolPoison(spaced, norm string, found []string, wording bool) []string {
 	if spaced == norm {
 		return nil
 	}
 	var extra []string
-	for _, name := range checkToolPoison(spaced) {
+	for _, name := range checkToolPoisonWithWording(spaced, wording) {
 		if !slices.Contains(found, name) {
 			extra = append(extra, name)
 		}
@@ -310,18 +314,20 @@ func (c *ToolScanConfig) now() time.Time {
 // ToolBaseline tracks SHA256 hashes of tool definitions for rug pull detection
 // and session binding (known tool inventory). Safe for concurrent use.
 type ToolBaseline struct {
-	mu             sync.Mutex
-	hashes         map[string]string                   // tool name → SHA256(description + inputSchema)
-	structural     map[string]string                   // tool name → digest of everything but the description
-	descs          map[string]string                   // tool name → last known description text
-	params         map[string][]string                 // tool name → last known parameter names (sorted)
-	knownTools     map[string]bool                     // session binding: tool name set from first tools/list
-	knownA2A       map[string]bool                     // session binding: A2A method identity set from trusted inventory
-	headerBindings map[string]map[string]HeaderBinding // tool name -> lower-case Mcp-Param name -> schema binding
-	pendingTools   map[string]struct{}                 // names admitted for a response that has not forwarded yet
-	hasBaseline    bool                                // true after first SetKnownTools call
-	hasA2A         bool                                // true after first SetKnownA2AMethods call
-	driftEpoch     uint64                              // increments when operator reset clears drift state
+	mu                     sync.Mutex
+	hashes                 map[string]string         // tool name → SHA256(description + inputSchema)
+	structural             map[string]string         // tool name → digest of everything but the description
+	descs                  map[string]string         // tool name → last known description text
+	params                 map[string][]string       // tool name → last known parameter names (sorted)
+	knownTools             map[string]bool           // session binding: tool name set from first tools/list
+	knownA2A               map[string]bool           // session binding: A2A method identity set from trusted inventory
+	headerBindings         map[string]HeaderContract // structural observations, independent of knownTools/drift trust
+	inventorySequence      uint64
+	headerContractVersions map[string]uint64
+	pendingTools           map[string]struct{} // names admitted for a response that has not forwarded yet
+	hasBaseline            bool                // true after first SetKnownTools call
+	hasA2A                 bool                // true after first SetKnownA2AMethods call
+	driftEpoch             uint64              // increments when operator reset clears drift state
 	// driftEstablished is true once a first tools/list inventory has FINISHED
 	// being evaluated against this baseline (EndInventoryResponse), not when
 	// it began. It is captured ONCE per response, before that response's own
@@ -385,7 +391,7 @@ func NewToolBaseline() *ToolBaseline {
 		structural:     make(map[string]string),
 		descs:          make(map[string]string),
 		params:         make(map[string][]string),
-		headerBindings: make(map[string]map[string]HeaderBinding),
+		headerBindings: make(map[string]HeaderContract),
 		pendingTools:   make(map[string]struct{}),
 	}
 }
@@ -438,7 +444,14 @@ func namesFitCapacity[T any](stored map[string]T, names []string) bool {
 }
 
 func namesFitCapacityWithPending[T any](stored map[string]T, pending map[string]struct{}, names []string) bool {
-	needed := len(stored) + len(pending)
+	// Delivery names and structural contracts reserve the same bounded union.
+	// A pending contract can already be a delivered name (and vice versa).
+	needed := len(stored)
+	for name := range pending {
+		if _, exists := stored[name]; !exists {
+			needed++
+		}
+	}
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
 		if _, exists := stored[name]; exists {
@@ -1091,9 +1104,10 @@ func (tb *ToolBaseline) IsKnownA2AMethod(method string) bool {
 type ToolInventoryReservation struct {
 	baseline *ToolBaseline
 	names    []string
-	defs     []ToolDef
-	bindings map[string]map[string]HeaderBinding
+	bindings map[string]HeaderContract
 	reserved []string
+	sequence uint64
+	finished bool
 }
 
 // ReserveToolInventory reserves all state that a clean tools/list response
@@ -1122,10 +1136,12 @@ func (tb *ToolBaseline) ReserveToolInventory(names []string, defs []ToolDef) (*T
 		return nil, ErrBaselineCapacity
 	}
 
-	reserved := make([]string, 0, len(names))
+	reservationNames := append(append([]string(nil), names...), bindingNames...)
+	reserved := make([]string, 0, len(reservationNames))
 	claimed := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		if _, known := tb.knownTools[name]; known {
+	for _, name := range reservationNames {
+		_, contractKnown := tb.headerBindings[name]
+		if _, known := tb.knownTools[name]; known && contractKnown {
 			continue
 		}
 		if _, repeat := claimed[name]; repeat {
@@ -1141,7 +1157,8 @@ func (tb *ToolBaseline) ReserveToolInventory(names []string, defs []ToolDef) (*T
 		claimed[name] = struct{}{}
 		reserved = append(reserved, name)
 	}
-	return &ToolInventoryReservation{baseline: tb, names: names, defs: defs, bindings: bindings, reserved: reserved}, nil
+	tb.inventorySequence++
+	return &ToolInventoryReservation{baseline: tb, names: append([]string(nil), names...), bindings: bindings, reserved: reserved, sequence: tb.inventorySequence}, nil
 }
 
 // Release discards a reservation after the response did not reach the client.
@@ -1151,21 +1168,30 @@ func (r *ToolInventoryReservation) Release() {
 	}
 	r.baseline.mu.Lock()
 	defer r.baseline.mu.Unlock()
+	if r.finished {
+		return
+	}
+	r.finished = true
 	for _, name := range r.reserved {
 		delete(r.baseline.pendingTools, name)
 	}
 	r.reserved = nil
 }
 
-// Commit makes a reserved tools/list response trusted after it has forwarded.
+// Commit records client delivery and structural contracts after forwarding.
+// The clean argument is retained for compatibility; drift trust is scan-owned.
 // It is infallible: Reserve already held every slot this response needs.
-func (r *ToolInventoryReservation) Commit(clean bool) []string {
+func (r *ToolInventoryReservation) Commit(_ bool) []string {
 	if r == nil || r.baseline == nil {
 		return nil
 	}
 	tb := r.baseline
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
+	if r.finished {
+		return nil
+	}
+	r.finished = true
 	defer func() {
 		for _, name := range r.reserved {
 			delete(tb.pendingTools, name)
@@ -1188,16 +1214,21 @@ func (r *ToolInventoryReservation) Commit(clean bool) []string {
 	tb.hasBaseline = true
 
 	if tb.headerBindings == nil {
-		tb.headerBindings = make(map[string]map[string]HeaderBinding)
+		tb.headerBindings = make(map[string]HeaderContract)
 	}
-	for _, def := range r.defs {
-		bindings, valid := r.bindings[def.Name]
-		if !clean || !valid {
-			delete(tb.headerBindings, def.Name)
+	// Structural contracts follow the exact forwarded definition even under
+	// warn. The clean bit belongs to scan/drift trust, not schema interpretation.
+	if tb.headerContractVersions == nil {
+		tb.headerContractVersions = make(map[string]uint64)
+	}
+	for name, contract := range r.bindings {
+		if tb.headerContractVersions[name] > r.sequence {
 			continue
 		}
-		tb.headerBindings[def.Name] = bindings
+		tb.headerBindings[name] = contract
+		tb.headerContractVersions[name] = r.sequence
 	}
+
 	return added
 }
 
@@ -1240,6 +1271,8 @@ const toolPoisonKeywords = `IMPORTANT|CRITICAL|SYSTEM|INSTRUCTION|SECRET|HIDDEN|
 // read/send verb family, so "Provide ~/.aws/credentials" read as benign while
 // "Send ~/.aws/credentials" blocked.
 const handoverRequestFinding = "Credential Request Directive"
+
+const dangerousCapabilityFinding = "Dangerous Capability"
 
 // handoverRequestVerb is the base-form imperative a poisoned description uses
 // to ask the agent to hand over secret material. Third-person forms
@@ -1360,7 +1393,7 @@ var toolPoisonPatterns = []*compiledToolPattern{
 		re:   regexp.MustCompile(`(?i)(instead\s+of|rather\s+than|don't\s+use|never\s+use|always\s+prefer)\s+(using\s+)?(the\s+)?\w+\s+(tool|function|command)`),
 	},
 	{
-		name: "Dangerous Capability",
+		name: dangerousCapabilityFinding,
 		// Detects tools that describe executing local files, scripts, or commands.
 		// Standalone "script"/"file" require a determiner (a/the/any) to avoid
 		// false positives on "Execute the deployment script" or "Run the build
@@ -1381,7 +1414,7 @@ var toolPoisonPatterns = []*compiledToolPattern{
 		),
 	},
 	{
-		name: "Dangerous Capability",
+		name: dangerousCapabilityFinding,
 		// Detects tools that download from URLs then execute the result.
 		// Requires "it"/"them" after the execute verb to avoid false positives
 		// on "Fetch data and run the analysis" where fetch and run act on
@@ -1389,7 +1422,7 @@ var toolPoisonPatterns = []*compiledToolPattern{
 		re: regexp.MustCompile(`(?i)(download|fetch|retriev)\w*\s+.{0,60}(execut|run|launch)\w*\s+(?:it|them)\b`),
 	},
 	{
-		name: "Dangerous Capability",
+		name: dangerousCapabilityFinding,
 		// Detects tools that instruct calling external commands via tool chain.
 		// Catches "call the bash tool to run: curl", "use the shell tool to execute",
 		// and similar patterns where a tool description directs the agent to invoke
@@ -1479,8 +1512,10 @@ var directiveParamPattern = regexp.MustCompile(
 // scan path reads neither the top-level suppress list nor response-scanning
 // server trust. The only operator controls are mcp_tool_scanning.action (warn
 // instead of block) and mcp_tool_scanning.enabled, and the latter turns off
-// every tool-poison check. Warn is not a stable remedy while adaptive
-// enforcement is on: each warned finding records a near-miss, and enough of
+// every tool-poison check. Parameter-name checks are independent of the global
+// prompt_injection_detection wording switch. The per-surface
+// warn action alone is not a stable remedy while adaptive enforcement is on:
+// each warned finding records a near-miss, and enough of
 // them escalate the session until the same list is blocked. The one built-in
 // exception is isOrdinaryContextLeakIdentifier.
 var contextLeakParamPattern = regexp.MustCompile(
@@ -2215,8 +2250,15 @@ func parseToolsList(result json.RawMessage) ([]ToolDef, error) {
 
 // checkToolPoison runs tool-specific poisoning patterns against normalized text.
 func checkToolPoison(text string) []string {
+	return checkToolPoisonWithWording(text, true)
+}
+
+func checkToolPoisonWithWording(text string, wording bool) []string {
 	var findings []string
 	for _, p := range toolPoisonPatterns {
+		if !wording && p.name != dangerousCapabilityFinding {
+			continue
+		}
 		// FindStringIndex on the remaining suffix has FindAll's non-overlap
 		// semantics without allocating an index slice for every match.
 		for offset := 0; offset < len(text); {
@@ -2697,6 +2739,12 @@ func toolScanCapacityLimit(defs []ToolDef, names []string, cfg *ToolScanConfig) 
 
 func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (matches, observations []ToolScanMatch, capacityExceeded, epochChanged bool) {
 	confusableNames := confusableToolNameCollisions(tools)
+	var headerContracts map[string]HeaderContract
+	if cfg.RequireHeaderContracts && cfg.DetectDrift {
+		// Filtering rejects duplicate names as well as invalid schemas. Drift
+		// admission must use that same inventory-wide structural decision.
+		headerContracts = headerBindingsForDefs(tools)
+	}
 
 	// Captured ONCE, before this response's tools are evaluated, so an
 	// earlier sibling promoted earlier in THIS SAME loop (e.g. the very
@@ -2735,7 +2783,8 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 	prescans := make([]toolPrescan, len(tools))
 	responseAckRefused := false
 	for i, tool := range tools {
-		prescans[i] = prescanTool(cfg, tool)
+		_, hasAck := findCredentialAck(cfg, tool.Name)
+		prescans[i] = prescanTool(cfg, tool, sc.PromptInjectionMode() != config.ActionAllow || hasAck)
 		if outcome, ok := credentialAckOutcome(cfg, tool, prescans[i], ackNow); ok {
 			ackOutcomes[i] = outcome
 			responseAckRefused = responseAckRefused || outcome != CredentialAckAcknowledged
@@ -2762,16 +2811,29 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 		pre := prescans[toolIndex]
 		text := pre.text
 
-		if text == "" {
-			// A reviewed tool can shrink to no scanner text at all. Its entry
-			// is still evaluated, against no occurrences, so it refuses like
-			// any other stale entry instead of being skipped.
-			if outcome := ackOutcomes[toolIndex]; outcome != "" {
-				match.CredentialAck = outcome
-				hasFinding = true
+		// Capability rules describe executable behavior rather than instructions
+		// to the agent. They retain the tool scanner's action in every mode. Only
+		// a reduced wording policy moves them ahead of the wording cap; the
+		// default keeps the finding order and the receipt pattern it selects.
+		mode := sc.PromptInjectionMode()
+		separateCapability := mode == config.ActionWarn || mode == config.ActionAllow
+		if separateCapability {
+			for _, findings := range [][]string{pre.poison, pre.spacedPoison} {
+				if slices.Contains(findings, dangerousCapabilityFinding) && !slices.Contains(match.ToolPoison, dangerousCapabilityFinding) {
+					match.ToolPoison = append(match.ToolPoison, dangerousCapabilityFinding)
+					hasFinding = true
+				}
 			}
 		}
-		if text != "" {
+		structuralPoisonCount := len(match.ToolPoison)
+
+		// Explicit acknowledgment bindings still refuse stale or invalid entries
+		// even when the operator disables wording detection.
+		if outcome := ackOutcomes[toolIndex]; outcome != "" && outcome != CredentialAckAcknowledged {
+			match.CredentialAck = outcome
+			hasFinding = true
+		}
+		if text != "" && sc.PromptInjectionMode() != config.ActionAllow {
 			// This is the dedicated tool scanner, whose action is independent of
 			// response scanning. The response path itself never scans tool
 			// descriptions, preserving the tools/list false-positive carve-out.
@@ -2785,6 +2847,11 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 			// Normalization prevents zero-width char and confusable bypasses.
 			poison := slices.Clone(pre.poison)
 			spacedPoison := slices.Clone(pre.spacedPoison)
+			if separateCapability {
+				isCapability := func(name string) bool { return name == dangerousCapabilityFinding }
+				poison = slices.DeleteFunc(poison, isCapability)
+				spacedPoison = slices.DeleteFunc(spacedPoison, isCapability)
+			}
 			hasRequest := pre.hasCredentialRequest()
 			// A configured entry is evaluated whether or not its finding is
 			// still present: a reviewed tool whose wording changed or was
@@ -2825,62 +2892,81 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 				match.ToolPoison = append(match.ToolPoison, poison...)
 				hasFinding = true
 			}
+		}
 
-			// Exfiltration + context-leak param patterns: run per-param to avoid
-			// false positives from action words in the description pairing with
-			// sensitive targets in unrelated parameters. Each param is checked
-			// against both patterns; the first match per pattern is reported.
-			var exfilHit, contextHit bool
-			directiveHit := len(directiveKeys) > 0
-			if directiveHit {
+		// The operator cap applies only to wording findings, before drift
+		// admission. Structural collisions and acknowledgment refusals retain
+		// their existing behavior, as does drift below.
+		if sc.PromptInjectionMode() == config.ActionWarn && len(match.ToolPoison) > structuralPoisonCount {
+			wording := slices.Clone(match.ToolPoison[structuralPoisonCount:])
+			sc.ReportInjectionWarnings(context.Background(), wording)
+			observations = append(observations, ToolScanMatch{ToolName: tool.Name, ToolPoison: wording})
+			match.ToolPoison = match.ToolPoison[:structuralPoisonCount]
+			hasFinding = len(match.ToolPoison) > 0 || len(match.Injection) > 0 || (match.CredentialAck != "" && match.CredentialAck != CredentialAckAcknowledged)
+		}
+
+		// Exfiltration + context-leak param patterns: run per-param to avoid
+		// false positives from action words in the description pairing with
+		// sensitive targets in unrelated parameters. Each param is checked
+		// against both patterns; the first match per pattern is reported.
+		var exfilHit, contextHit bool
+		directiveHit := len(directiveKeys) > 0
+		if directiveHit {
+			match.ToolPoison = append(match.ToolPoison, "Directive Parameter Name")
+			hasFinding = true
+		}
+		for _, name := range paramNames {
+			if exfilHit && contextHit && directiveHit {
+				break
+			}
+			expanded := normalize.ForToolText(expandParamName(name))
+			if !directiveHit && directiveParamPattern.MatchString(expanded) {
 				match.ToolPoison = append(match.ToolPoison, "Directive Parameter Name")
 				hasFinding = true
+				directiveHit = true
 			}
-			for _, name := range paramNames {
-				if exfilHit && contextHit && directiveHit {
-					break
-				}
-				expanded := normalize.ForToolText(expandParamName(name))
-				if !directiveHit && directiveParamPattern.MatchString(expanded) {
-					match.ToolPoison = append(match.ToolPoison, "Directive Parameter Name")
-					hasFinding = true
-					directiveHit = true
-				}
-				if !exfilHit && exfilParamPattern.MatchString(expanded) {
-					match.ToolPoison = append(match.ToolPoison, "Exfiltration Parameter Name")
-					hasFinding = true
-					exfilHit = true
-				}
-				if !contextHit && !isOrdinaryContextLeakIdentifier(name) && contextLeakParamPattern.MatchString(expanded) {
-					match.ToolPoison = append(match.ToolPoison, "Context-Leak Parameter Name")
-					hasFinding = true
-					contextHit = true
-				}
+			if !exfilHit && exfilParamPattern.MatchString(expanded) {
+				match.ToolPoison = append(match.ToolPoison, "Exfiltration Parameter Name")
+				hasFinding = true
+				exfilHit = true
 			}
+			if !contextHit && !isOrdinaryContextLeakIdentifier(name) && contextLeakParamPattern.MatchString(expanded) {
+				match.ToolPoison = append(match.ToolPoison, "Context-Leak Parameter Name")
+				hasFinding = true
+				contextHit = true
+			}
+		}
 
-			// Community rule bundle extra-poison patterns.
-			if cfg != nil && len(cfg.ExtraPoison) > 0 {
-				name := tool.Name
-				desc := extractToolRuleDescriptionText(tool)
-				normName := [2]string{normalize.ForToolText(name), normalize.ForToolTextSpaced(name)}
-				normDesc := [2]string{normalize.ForToolText(desc), normalize.ForToolTextSpaced(desc)}
-				for _, ep := range cfg.ExtraPoison {
-					if ep == nil || ep.Re == nil || ep.Name == "" {
+		// Community rule bundle extra-poison patterns.
+		if cfg != nil && len(cfg.ExtraPoison) > 0 {
+			name := tool.Name
+			desc := extractToolRuleDescriptionText(tool)
+			normName := [2]string{normalize.ForToolText(name), normalize.ForToolTextSpaced(name)}
+			normDesc := [2]string{normalize.ForToolText(desc), normalize.ForToolTextSpaced(desc)}
+			for _, ep := range cfg.ExtraPoison {
+				if ep == nil || ep.Re == nil || ep.Name == "" {
+					continue
+				}
+				var target [2]string
+				switch ep.ScanField {
+				case "name":
+					target = normName
+				case "", "description":
+					if sc.PromptInjectionMode() == config.ActionAllow {
 						continue
 					}
-					var target [2]string
-					switch ep.ScanField {
-					case "name":
-						target = normName
-					case "", "description":
-						target = normDesc
-					default:
+					target = normDesc
+				default:
+					continue
+				}
+				if ep.Re.MatchString(target[0]) || ep.Re.MatchString(target[1]) {
+					if ep.ScanField != "name" && sc.PromptInjectionMode() == config.ActionWarn {
+						sc.ReportInjectionWarnings(context.Background(), []string{ep.Name})
+						observations = append(observations, ToolScanMatch{ToolName: tool.Name, ToolPoison: []string{ep.Name}})
 						continue
 					}
-					if ep.Re.MatchString(target[0]) || ep.Re.MatchString(target[1]) {
-						match.ToolPoison = append(match.ToolPoison, ep.Name)
-						hasFinding = true
-					}
+					match.ToolPoison = append(match.ToolPoison, ep.Name)
+					hasFinding = true
 				}
 			}
 		}
@@ -2907,6 +2993,14 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 			// change that block mode would otherwise accept.
 			promoteNew := !responseAckRefused && (!blocking || !hasFinding)
 			promoteChanged := !responseAckRefused && !blocking
+			promoteAccepted := !responseAckRefused && (!blocking || !hasFinding)
+			if cfg.RequireHeaderContracts {
+				// An invalid header contract removes the definition from the
+				// forwarded list, so the agent never receives it either.
+				if headerContracts[tool.Name].State == HeaderContractInvalid {
+					promoteNew, promoteChanged, promoteAccepted = false, false, false
+				}
+			}
 			// blockNewTools governs admission of a NAME absent from an
 			// already-established baseline. It is independent of the
 			// content-based promotion above: a scan-clean new tool would
@@ -2937,7 +3031,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 				EstablishedBeforeResponse: establishedBeforeResponse,
 				// hasFinding carries every earlier per-tool verdict in this
 				// loop: injection, poison, confusable name, exfil parameter.
-				PromoteAccepted: !responseAckRefused && (!blocking || !hasFinding),
+				PromoteAccepted: promoteAccepted,
 				Classify: func(prevDesc string, structuralChanged bool) []string {
 					return introducedDriftCues(prevDesc, tool.Description, structuralChanged)
 				},
