@@ -160,6 +160,9 @@ type ToolScanConfig struct {
 	// definition excluded for an invalid contract never becomes drift trust;
 	// warned definitions follow the ordinary warn-policy adoption.
 	RequireHeaderContracts bool
+	// ContractDiscovery inspects internal inventories without establishing or
+	// promoting a drift baseline. Delivery and approval remain separate.
+	ContractDiscovery bool
 	// Baseline holds the caller-scoped baseline for session binding. It is also
 	// the drift baseline unless DriftBaseline is set.
 	Baseline *ToolBaseline
@@ -618,9 +621,11 @@ func (e DriftEvaluation) Accepted() bool { return e.Drifted && len(e.Cues) == 0 
 // DefinitionEvaluation carries one tool definition and the promotion policy to
 // apply to it.
 type DefinitionEvaluation struct {
-	Name string
-	Hash string
-	Desc string
+	// ReadOnly compares against drift trust without changing it.
+	ReadOnly bool
+	Name     string
+	Hash     string
+	Desc     string
 	// Params are the tool's parameter names, already sorted.
 	Params []string
 	// Structural is the digest of everything except the description.
@@ -684,6 +689,9 @@ func (tb *ToolBaseline) EvaluateDefinition(in DefinitionEvaluation) DriftEvaluat
 
 	promoted := false
 	promote := func() {
+		if in.ReadOnly {
+			return
+		}
 		promoted = true
 		tb.hashes[name] = hash
 		tb.descs[name] = desc
@@ -2383,6 +2391,19 @@ const methodToolsList = "tools/list"
 // left to general response scanning; with no method, or tools/list, a malformed
 // "tools" field fails closed.
 func ScanToolsForMethod(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, method string) ToolScanResult {
+	return ScanToolsForMethodContext(context.Background(), line, sc, cfg, method)
+}
+
+// ScanToolsForMethodContext preserves scan attribution for wording observations.
+//
+// The context carries attribution only. Cancellation is detached so a canceled
+// request cannot turn an unfinished description scan into a tool finding; the
+// verdict matches a scan made with context.Background.
+func ScanToolsForMethodContext(ctx context.Context, line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, method string) ToolScanResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
 	if cfg == nil {
 		return ToolScanResult{IsToolsList: false, Clean: true}
 	}
@@ -2402,14 +2423,14 @@ func ScanToolsForMethod(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, m
 	// single object, which would return Clean and skip per-element scanning.
 	if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] == '[' {
 		// Batch elements do not carry a per-element tracked method.
-		return scanToolsBatch(trimmed, sc, cfg)
+		return scanToolsBatch(ctx, trimmed, sc, cfg)
 	}
 
-	return scanToolsSingle(line, sc, cfg, method)
+	return scanToolsSingle(ctx, line, sc, cfg, method)
 }
 
 // scanToolsSingle scans a single JSON-RPC 2.0 response for tool poisoning.
-func scanToolsSingle(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, method string) ToolScanResult {
+func scanToolsSingle(ctx context.Context, line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, method string) ToolScanResult {
 	var rpc jsonrpc.RPCResponse
 	if err := json.Unmarshal(line, &rpc); err != nil {
 		return ToolScanResult{IsToolsList: false, Clean: true}
@@ -2445,7 +2466,7 @@ func scanToolsSingle(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, meth
 		// it establishes the drift baseline: otherwise an upstream could
 		// bootstrap with an empty list and introduce a new name afterwards that
 		// read as another initial inventory, bypassing new_tool_admission: withhold.
-		if cfg != nil && cfg.DetectDrift {
+		if cfg != nil && cfg.DetectDrift && !cfg.ContractDiscovery {
 			driftBaseline := cfg.DriftBaseline
 			if driftBaseline == nil {
 				driftBaseline = cfg.Baseline
@@ -2480,7 +2501,7 @@ func scanToolsSingle(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig, meth
 		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: resourceLimit, RPCID: rpc.ID, ToolNames: names, ToolDefs: tools}
 	}
 
-	matches, observations, capacityExceeded, epochChanged := scanToolDefs(tools, sc, cfg)
+	matches, observations, capacityExceeded, epochChanged := scanToolDefsContext(ctx, tools, sc, cfg)
 	if epochChanged {
 		return ToolScanResult{IsToolsList: true, Clean: false, ResourceLimit: "tool_definition_baseline_reset", RPCID: rpc.ID, ToolNames: names, ToolDefs: tools, Observations: observations}
 	}
@@ -2655,7 +2676,7 @@ func uninspectableBatchElement(elem json.RawMessage) (ToolScanResult, bool) {
 
 // scanToolsBatch scans a JSON-RPC 2.0 batch response for tool poisoning.
 // Each element is checked independently; results are aggregated.
-func scanToolsBatch(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig) ToolScanResult {
+func scanToolsBatch(ctx context.Context, line []byte, sc *scanner.Scanner, cfg *ToolScanConfig) ToolScanResult {
 	var batch []json.RawMessage
 	if err := json.Unmarshal(line, &batch); err != nil {
 		return ToolScanResult{IsToolsList: false, Clean: true}
@@ -2681,7 +2702,7 @@ func scanToolsBatch(line []byte, sc *scanner.Scanner, cfg *ToolScanConfig) ToolS
 	}
 
 	for _, elem := range batch {
-		r := scanToolsSingle(elem, sc, cfg, "")
+		r := scanToolsSingle(ctx, elem, sc, cfg, "")
 		if r.IsToolsList {
 			isToolsList = true
 			if firstID == nil && len(r.RPCID) > 0 {
@@ -2738,6 +2759,10 @@ func toolScanCapacityLimit(defs []ToolDef, names []string, cfg *ToolScanConfig) 
 }
 
 func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (matches, observations []ToolScanMatch, capacityExceeded, epochChanged bool) {
+	return scanToolDefsContext(context.Background(), tools, sc, cfg)
+}
+
+func scanToolDefsContext(ctx context.Context, tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (matches, observations []ToolScanMatch, capacityExceeded, epochChanged bool) {
 	confusableNames := confusableToolNameCollisions(tools)
 	var headerContracts map[string]HeaderContract
 	if cfg.RequireHeaderContracts && cfg.DetectDrift {
@@ -2761,7 +2786,9 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 	// after the baseline. The expected epoch is compared in the same lock, so
 	// a reset landing after the caller's epoch check is not consumed here.
 	var establishedBeforeResponse bool
-	if cfg.DetectDrift {
+	if cfg.ContractDiscovery {
+		establishedBeforeResponse = driftBaselineForResponse.HasDriftBaseline()
+	} else if cfg.DetectDrift {
 		resp, established, epochChanged := driftBaselineForResponse.BeginInventoryResponseAtEpoch(cfg.ExpectedDriftEpoch)
 		if epochChanged {
 			return nil, nil, false, true
@@ -2837,7 +2864,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 			// This is the dedicated tool scanner, whose action is independent of
 			// response scanning. The response path itself never scans tool
 			// descriptions, preserving the tools/list false-positive carve-out.
-			result := sc.ScanResponse(context.Background(), text)
+			result := sc.ScanResponse(ctx, text)
 			if !result.Clean {
 				match.Injection = result.Matches
 				hasFinding = true
@@ -2899,7 +2926,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 		// their existing behavior, as does drift below.
 		if sc.PromptInjectionMode() == config.ActionWarn && len(match.ToolPoison) > structuralPoisonCount {
 			wording := slices.Clone(match.ToolPoison[structuralPoisonCount:])
-			sc.ReportInjectionWarnings(context.Background(), wording)
+			sc.ReportInjectionWarnings(ctx, wording)
 			observations = append(observations, ToolScanMatch{ToolName: tool.Name, ToolPoison: wording})
 			match.ToolPoison = match.ToolPoison[:structuralPoisonCount]
 			hasFinding = len(match.ToolPoison) > 0 || len(match.Injection) > 0 || (match.CredentialAck != "" && match.CredentialAck != CredentialAckAcknowledged)
@@ -2961,7 +2988,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 				}
 				if ep.Re.MatchString(target[0]) || ep.Re.MatchString(target[1]) {
 					if ep.ScanField != "name" && sc.PromptInjectionMode() == config.ActionWarn {
-						sc.ReportInjectionWarnings(context.Background(), []string{ep.Name})
+						sc.ReportInjectionWarnings(ctx, []string{ep.Name})
 						observations = append(observations, ToolScanMatch{ToolName: tool.Name, ToolPoison: []string{ep.Name}})
 						continue
 					}
@@ -3019,6 +3046,7 @@ func scanToolDefs(tools []ToolDef, sc *scanner.Scanner, cfg *ToolScanConfig) (ma
 			// change that only adds descriptive text so a legitimate vendor
 			// update does not re-report forever.
 			eval := driftBaseline.EvaluateDefinition(DefinitionEvaluation{
+				ReadOnly:                  cfg.ContractDiscovery,
 				Name:                      tool.Name,
 				Hash:                      hash,
 				Desc:                      tool.Description,

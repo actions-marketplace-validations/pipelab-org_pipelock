@@ -170,9 +170,10 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 	sc := opts.scanner()
 	approver := opts.Approver
 	toolCfg := opts.toolCfg()
-	if toolCfg != nil && opts.validateToolHeaders {
+	if toolCfg != nil && (opts.validateToolHeaders || opts.toolContractDiscovery) {
 		copyCfg := *toolCfg
 		copyCfg.RequireHeaderContracts = true
+		copyCfg.ContractDiscovery = opts.toolContractDiscovery
 		toolCfg = &copyCfg
 	}
 	ks := opts.KillSwitch
@@ -281,13 +282,16 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 		}
 
-		// On-entry de-escalation for long-lived response streams.
-		tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
-			sessionKey: opts.adaptiveSessionKey(),
-			reason:     adaptiveRecoveryTimer,
-			logger:     opts.AuditLogger,
-			metrics:    m,
-		}, opts.warnContext()))
+		// Private inventory inspection cannot lower the caller's security state.
+		// Ordinary response streams retain their on-entry recovery policy.
+		if !opts.toolContractDiscovery {
+			tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+				sessionKey: opts.adaptiveSessionKey(),
+				reason:     adaptiveRecoveryTimer,
+				logger:     opts.AuditLogger,
+				metrics:    m,
+			}, opts.warnContext()))
+		}
 
 		// A signed operator delegation is the only path that clears a stdio
 		// airlock. A malformed, expired, replayed, or absent authority leaves
@@ -521,11 +525,21 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// response scanner.
 		var toolInventoryReservation *tools.ToolInventoryReservation
 		reserveToolInventory := func() error {
-			if !isToolsList || toolCfg == nil || toolCfg.Baseline == nil || len(toolResult.ToolNames) == 0 && len(toolResult.ToolDefs) == 0 {
+			if opts.toolContractDiscovery || !isToolsList || toolCfg == nil || toolCfg.Baseline == nil || len(toolResult.ToolNames) == 0 && len(toolResult.ToolDefs) == 0 {
 				return nil
 			}
+			// x-mcp-header contracts belong to the 2026-07-28 tools/list. A
+			// server answering an older revision follows that revision (MCP
+			// 2026-07-28 Streamable HTTP, "Earlier Streamable HTTP Revisions"),
+			// so its inventory records delivery but never the current contract.
+			// Otherwise an unannotated legacy definition would read as a known
+			// contract and let modern calls skip discovery and mirror checks.
+			defs := toolResult.ToolDefs
+			if !opts.validateToolHeaders {
+				defs = nil
+			}
 			var err error
-			toolInventoryReservation, err = toolCfg.Baseline.ReserveToolInventory(toolResult.ToolNames, toolResult.ToolDefs)
+			toolInventoryReservation, err = toolCfg.Baseline.ReserveToolInventory(toolResult.ToolNames, defs)
 			return err
 		}
 		applyToolInventory := func() {
@@ -571,7 +585,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// evidence of clean behavior, so it earns no clean credit either.
 		toolAcknowledged := false
 		if toolCfg != nil {
-			toolResult = tools.ScanToolsForMethod(line, sc, toolCfg.WithServerMode(opts.ServerName, opts.ServerBinding, opts.ServerBindingMode, opts.ServerRevision), trackedMethod)
+			toolResult = tools.ScanToolsForMethodContext(opts.warnContext(), line, sc, toolCfg.WithServerMode(opts.ServerName, opts.ServerBinding, opts.ServerBindingMode, opts.ServerRevision), trackedMethod)
 			if err := opts.warnContext().Err(); err != nil {
 				if writeErr := blockScanError("response scan failed: " + err.Error()); writeErr != nil {
 					return foundInjection, writeErr
@@ -776,7 +790,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 		}
 
-		if isToolsList && opts.validateToolHeaders {
+		if isToolsList && opts.validateToolHeaders && !opts.toolContractDiscovery {
 			filtered, names, rejected, err := tools.FilterInvalidHeaderTools(line, toolResult.ToolDefs)
 			if err != nil {
 				if writeErr := blockScanError("invalid tool header contract response"); writeErr != nil {
@@ -871,7 +885,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			// Clean message: decay threat score. Skip decay when tool-poisoning
 			// was detected for this message - a near-miss signal and a clean
 			// decay on the same message would incorrectly counteract each other.
-			if !toolPoisonDetected && !toolAcknowledged {
+			if !opts.toolContractDiscovery && !toolPoisonDetected && !toolAcknowledged {
 				recordCleanSession(rec, adaptiveCfg, true, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
 					sessionKey: opts.adaptiveSessionKey(),
 					reason:     adaptiveRecoveryClean,
@@ -894,7 +908,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 			commitToolInventory()
 			emitTrackedOutcome(mcpResponseStatus(line), "complete", line)
-			observeMCPResponseTaint(taintOpts, toolPoisonDetected || toolAcknowledged)
+			observeMCPResponseFindings(taintOpts, toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged))
 			continue
 		}
 
@@ -977,7 +991,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					effectiveAction = config.ActionAllow
 					outbound = line
 					writeContext = "writing line"
-					observeMCPResponseTaint(taintOpts, true)
+					observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 				case hitl.DecisionStrip:
 					_, _ = fmt.Fprintf(logW, "pipelock: line %d: operator chose strip\n", lineNum)
 					if len(verdict.DLPMatches) > 0 && !scanner.OnlyInformational(verdict.DLPMatches) {
@@ -992,7 +1006,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 						outbound = msg
 						writeContext = "writing strip/block response"
 						if actualAction == config.ActionStrip {
-							observeMCPResponseTaint(taintOpts, true)
+							observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 						}
 					}
 				default: // DecisionBlock
@@ -1015,13 +1029,13 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				outbound = msg
 				writeContext = "writing strip/block response"
 				if actualAction == config.ActionStrip {
-					observeMCPResponseTaint(taintOpts, true)
+					observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 				}
 			}
 		default: // warn
 			outbound = line
 			writeContext = "writing line"
-			observeMCPResponseTaint(taintOpts, true)
+			observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 		}
 
 		requestID := canonicalID(verdict.ID)
@@ -1181,7 +1195,7 @@ func writeUnparseableResponse(o unparseableResponseOptions) (bool, []byte, error
 	frame, detail, lineNum, sc, writer, logW, opts := o.frame, o.detail, o.lineNum, o.sc, o.writer, o.logW, o.opts
 	denialAudit := mcpResponseInspectionBlockAudit("MCP response is unparseable")
 	_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, detail)
-	rawResult := sc.ScanResponse(context.Background(), string(frame.Raw))
+	rawResult := sc.ScanResponse(opts.warnContext(), string(frame.Raw))
 	if !rawResult.Clean {
 		_, _ = fmt.Fprintf(logW, "pipelock: line %d: injection in non-JSON content (%s)\n", lineNum, strings.Join(matchNames(rawResult.Matches), ", "))
 	}
