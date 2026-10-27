@@ -2662,6 +2662,12 @@ func (c *Config) validateMCPToolPolicy() error {
 	if c.MCPToolPolicy.Action == ActionDefer && !c.Defer.Enabled {
 		return fmt.Errorf("invalid mcp_tool_policy action %q: defer.enabled must be true", c.MCPToolPolicy.Action)
 	}
+	switch c.MCPToolPolicy.OnIncompleteCheck {
+	case "", ActionWarn, ActionBlock:
+		// valid; empty means warn
+	default:
+		return fmt.Errorf("invalid mcp_tool_policy on_incomplete_check %q: must be warn or block", c.MCPToolPolicy.OnIncompleteCheck)
+	}
 	// Validate redirect profiles.
 	for name, profile := range c.MCPToolPolicy.RedirectProfiles {
 		if len(profile.Exec) == 0 || profile.Exec[0] == "" {
@@ -4244,6 +4250,9 @@ func credentialAudienceSuppressPathSubset(raw string, audience []string) bool {
 }
 
 func (c *Config) validateKillSwitch() error {
+	if err := c.validateKillSwitchTokenSource(); err != nil {
+		return err
+	}
 	// Validate kill switch allowlist CIDRs are parseable
 	for _, cidr := range c.KillSwitch.AllowlistIPs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
@@ -4267,8 +4276,8 @@ func (c *Config) validateKillSwitch() error {
 		if apiPort == proxyPort {
 			return fmt.Errorf("kill_switch.api_listen port %s collides with fetch_proxy.listen port %s", apiPort, proxyPort)
 		}
-		if c.KillSwitch.APIToken == "" && os.Getenv(EnvKillSwitchAPIToken) == "" {
-			return fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token or %s to be set", EnvKillSwitchAPIToken)
+		if c.KillSwitch.APIToken == "" && c.KillSwitch.APITokenFile == "" && os.Getenv(EnvKillSwitchAPIToken) == "" {
+			return fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token, api_token_file or %s to be set", EnvKillSwitchAPIToken)
 		}
 	}
 	return nil

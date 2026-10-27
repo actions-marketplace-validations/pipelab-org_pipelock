@@ -615,6 +615,9 @@ type Config struct {
 	// Defaults(), Load(), and Clone().
 	canonicalRedactionKeyCache *canonicalHashCacheHolder `yaml:"-"`
 
+	// runtimeConfigDir anchors lazy credential reads to the config source.
+	runtimeConfigDir string `yaml:"-"`
+
 	// resolvedKillSwitchAPIToken stores the effective admin API token after
 	// runtime env/YAML resolution. It is deliberately unexported so env-sourced
 	// secret material is available to runtime wiring without entering YAML,
@@ -816,6 +819,11 @@ type MCPToolPolicy struct {
 	RedirectProfiles      map[string]RedirectProfile      `yaml:"redirect_profiles,omitempty"`
 	DeferResolverProfiles map[string]DeferResolverProfile `yaml:"defer_resolver_profiles,omitempty" json:"defer_resolver_profiles,omitempty"`
 	QuarantineDir         string                          `yaml:"quarantine_dir,omitempty"`
+	// OnIncompleteCheck is the action when a rule's check cannot rule out a
+	// match (a long argument list, or a match only across separate commands):
+	// warn (default) or block. Either way the verdict names
+	// incomplete_pair_check.
+	OnIncompleteCheck string `yaml:"on_incomplete_check,omitempty" json:"on_incomplete_check,omitempty"`
 }
 
 // DeferConfig configures per-action held authorization for supported MCP
@@ -1644,6 +1652,7 @@ type KillSwitch struct {
 	MetricsExempt *bool    `yaml:"metrics_exempt"`
 	APIExempt     *bool    `yaml:"api_exempt"` // exempt kill-switch and session admin routes under /api/v1 (default true)
 	APIToken      string   `yaml:"api_token"`
+	APITokenFile  string   `yaml:"api_token_file" json:",omitempty"`
 	APIListen     string   `yaml:"api_listen"` // separate listen address for kill switch API (e.g. "0.0.0.0:9090")
 	AllowlistIPs  []string `yaml:"allowlist_ips"`
 }

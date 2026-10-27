@@ -400,14 +400,16 @@ mcp_data_class_labels:
 mcp_tool_policy:
   enabled: true
   action: warn
+  # Argument lists too long to check every token pair: allow and log incomplete_pair_check.
+  on_incomplete_check: warn
   rules:
     - name: "Destructive File Delete"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)\brm\s+(--\s+)?(-[a-z]*[rf]\b|--(?:recursive|force)\b)'
+      arg_pattern: '(?i)\brm(?:\s+[^\s;|&]+)*?\s+(-[a-z]*[rf][a-z]*\b|--(?:recursive|force)\b)'
       action: block
     - name: "Recursive Permission Change"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)\b(chmod\s+(-R|--recursive)\s+(777|666)|chmod\s+(777|666)\s+(-R|--recursive)|chown\s+(-R|--recursive))\b'
+      arg_pattern: '(?i)\b(chmod(?:\s+[^\s;|&]+)*?\s+(-[a-z]*r[a-z]*|--recursive)(?:\s+[^\s;|&]+)*?\s+(0?(?:777|666)|(?:[ugoa]*[+=-][rwxXst]*,)*[ugo]*[ao][ugoa]*[+=][rwxXst]*w[rwxXst]*(?:,[ugoa]*[+=-][rwxXst]*)*)|chmod(?:\s+[^\s;|&]+)*?\s+(0?(?:777|666)|(?:[ugoa]*[+=-][rwxXst]*,)*[ugo]*[ao][ugoa]*[+=][rwxXst]*w[rwxXst]*(?:,[ugoa]*[+=-][rwxXst]*)*)(?:\s+[^\s;|&]+)*?\s+(-[a-z]*r[a-z]*|--recursive)|chown(?:\s+[^\s;|&]+)*?\s+(-[a-z]*r[a-z]*|--recursive))\b'
     - name: "Credential File Access"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec|read_file|file_read|read_text_file|read_media_file|read_multiple_files|head_file|tail_file|batch_read|create_symlink|create_hardlink|move_file|file_move|rename_file|move-file|copy_file|file_copy)$'
       arg_pattern: '(?i)(\.ssh[\\/]?(?:id_[a-z0-9_-]*(?:$|[^a-z0-9_.-]|\.(?:$|[^p]|p(?:$|[^u]|u(?:$|[^b]|b[\s\S]))))|authorized)|\.aws[\\/]?credentials|\.env\b|\.netrc|/etc/shadow)'
@@ -430,25 +432,25 @@ mcp_tool_policy:
       action: block
     - name: "Network Exfiltration"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)\b(curl|wget)\b.*(-d\s|-F\s|-T\s|--data(?:-binary|-raw|-urlencode)?\b|--form\b|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b|-X\s+POST)'
+      arg_pattern: '(?i)\b(curl|wget)\b.*(-d\s|-F\s|-T\s|--data(?:-binary|-raw|-urlencode)?\b|--form\b|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b|-X\s+POST|--json\b|--form-string\b)|\bcurl\b.*\s(?-i:-[a-zA-Z0-9]+[dFT])'
     - name: "Reverse Shell"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e)'
+      arg_pattern: '(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e|\b(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+-[a-z0-9]*e\b|\b(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+((?-i:-[a-z0-9]*c)\b|--(?:sh-|lua-)?exec\b)|\bbash(?:\s+-[a-z]+)*?\s+-[a-z]*i[a-z]*(?:\s+-[a-z]+)*?\s+>&|/dev/udp/)'
       action: block
     - name: "Disk Wipe Command"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)\b(dd\s+if=.*of=/dev/|mkfs\.|fdisk)\b'
+      arg_pattern: '(?i)\b(dd\b.*of=/dev/|mkfs\.|fdisk|sfdisk|mke2fs|blkdiscard|mkfs(?:\s+[^\s;|&]+)*?\s+(?:-t|/dev/)|wipefs(?:\s+[^\s;|&]+)*?\s+(?:-[a-z]*[ao][a-z]*|--all|--offset)|sgdisk(?:\s+[^\s;|&]+)*?\s+(?:-[a-z]*z[a-z]*|--zap(?:-all)?))\b'
       action: block
     - name: "Package Install"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)\b(pip|npm|gem|cargo|go)\s+install\b'
+      arg_pattern: '(?i)\b(pip3?|npm|gem|cargo|go)(?:\s+-[^\s;|&]*(?:\s+[^-\s;|&][^\s;|&]*)?)*\s+install\b|\b(npm|pnpm|yarn|bun)(?:\s+-[^\s;|&]*(?:\s+[^-\s;|&][^\s;|&]*)?)*\s+(i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|add)\b|\b(uv|poetry|cargo)(?:\s+-[^\s;|&]*(?:\s+[^-\s;|&][^\s;|&]*)?)*\s+add\b'
     - name: "Destructive Git Operation"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec|git)$'
-      arg_pattern: '(?i)(\bgit\s+)?(push\s+(--force(\s|$)|-f\b)|reset\s+--hard\b|clean\s+-fd\b)'
+      arg_pattern: '(?i)(\bgit\s+)?(push(?:\s+[^\s;|&]+)*?\s+(--force(?:[\s;&|()<>]|$)|-[a-z]*f[a-z]*\b|\+[^\s;|&]+)|reset(?:\s+[^\s;|&]+)*?\s+--hard\b|clean(?:\s+[^\s;|&]+)*?\s+(-[a-z]*(f[a-z]*d|d[a-z]*f)[a-z]*\b|-[a-z]*f[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*d[a-z]*\b|-[a-z]*d[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*f[a-z]*\b))'
       action: block
     - name: "Encoded Command Execution"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)(\beval\b.*\bbase64\b|\bbase64\s+(-d|--decode)\b.*\|\s*(ba)?sh\b)'
+      arg_pattern: '(?i)(\beval\b.*\bbase64\b|\bbase64(?:\s+[^\s;|&]+)*?\s+(-[a-z]*d[a-z]*|--decode)\b.*\|\s*(?:(?:sudo|env|exec|command)(?:\s+[^\s;|&]+)*?\s+)?(?:[^\s;|&]*/)?((ba)?sh|zsh|dash|ksh|mksh)\b)'
       action: block
     - name: "Cron Job Persistence"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
@@ -503,7 +505,7 @@ mcp_tool_policy:
       action: block
     - name: "Detached Process Spawning"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
-      arg_pattern: '(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux\s+(new-session|new)\s+-d)'
+      arg_pattern: '(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux(?:\s+[^\s;|&]+)*?\s+(new-session|new)(?:\s+[^\s;|&]+)*?\s+-[a-z]*d)'
     - name: "Audit Log Move"
       tool_pattern: '(?i)^(?:mcp__[a-z0-9_-]+__|[a-z0-9_-]+[.:])?(move_file|file_move|rename_file|move-file)$'
       arg_pattern: '(?i)(?:^|[\s/])(?:var/log|var/lib/pipelock)(?:/|$)'

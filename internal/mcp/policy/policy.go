@@ -30,7 +30,16 @@ const (
 	duplicateJSONKeyRule          = "duplicate_json_object_key"
 	invalidJSONKeyInputRule       = "invalid_json_key_input"
 	malformedA2AParamsRule        = "malformed_a2a_params"
+	// incompletePairCheckRule names the signal for a rule whose check could
+	// not rule out a match: its pairwise view could not cover an over-long
+	// argument list, or it matches only across separate commands. Its action
+	// comes from mcp_tool_policy.on_incomplete_check.
+	incompletePairCheckRule = IncompletePairCheckRule
 )
+
+// IncompletePairCheckRule is the rule name a verdict carries when a rule's
+// check could not rule out a match; Verdict.IncompleteRules names those rules.
+const IncompletePairCheckRule = "incomplete_pair_check"
 
 // shellExpansionRe matches shell variable expansions used as whitespace substitutes.
 // Attackers use ${IFS} or $IFS to replace spaces: "rm${IFS}-rf" expands to "rm -rf"
@@ -145,6 +154,10 @@ type Config struct {
 	RedirectProfiles      map[string]config.RedirectProfile      // keyed by profile name
 	DeferResolverProfiles map[string]config.DeferResolverProfile // keyed by profile name
 
+	// IncompleteAction applies when a rule's pairwise view stops before it
+	// covers every distinct token: warn (default when empty) or block.
+	IncompleteAction string
+
 	// localPaths, when set, also matches what submitted paths resolve to on
 	// this host. See EnableLocalPathIdentity.
 	localPaths *localPathIdentity
@@ -179,6 +192,8 @@ type Verdict struct {
 	// directory that could not be listed to rule out a hard link. They never
 	// change the action or the rule names.
 	Notes []string
+	// IncompleteRules names the rules behind IncompletePairCheckRule.
+	IncompleteRules []string
 }
 
 // New compiles policy rules from config. Returns nil if disabled or no rules
@@ -190,6 +205,7 @@ func New(cfg config.MCPToolPolicy) *Config {
 	}
 	pc := &Config{
 		Action:                cfg.Action,
+		IncompleteAction:      cfg.OnIncompleteCheck,
 		RedirectProfiles:      cfg.RedirectProfiles,
 		DeferResolverProfiles: cfg.DeferResolverProfiles,
 	}
@@ -246,6 +262,10 @@ func (pc *Config) CheckToolCall(toolName string, argStrings []string) Verdict {
 //  3. Pairwise token combinations - catches map-ordering evasion where
 //     command and flags land in separate values with non-deterministic order
 func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, rawArgs json.RawMessage) Verdict {
+	return pc.checkToolCallWithArgs(toolName, argStrings, rawArgs, true)
+}
+
+func (pc *Config) checkToolCallWithArgs(toolName string, argStrings []string, rawArgs json.RawMessage, checkInput bool) Verdict {
 	if pc == nil || len(pc.Rules) == 0 {
 		return Verdict{}
 	}
@@ -284,18 +304,21 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 	// With local path identity enabled, the resolved location of each submitted
 	// path joins the match set, so a link to a protected file matches the rule
 	// that protects it.
-	matchArgs, linkNotes := pc.localPaths.expandNoted(argStrings)
-	tokens, joined := normalizeArgTokens(matchArgs, normalize.ForMatching, policyPreNormalize)
-	altTokens, altJoined := normalizeArgTokens(matchArgs, normalize.ForPolicy, policyPreNormalize)
-	baseTokens, baseJoined := normalizeArgTokens(matchArgs, normalize.ForMatching, nil)
+	//
 	// Literal view: each submitted string exactly as sent. Normalization strips
 	// shell quotes, which is right for command text but lets a file tool path
 	// such as `id_rsa.p'ub` read as `id_rsa.pub` while the tool opens the file
 	// with the quote in its name. Matching the literal string as well keeps a
 	// normalized spelling from narrowing what a pattern sees.
-	rawTokens, rawJoined := literalArgTokens(matchArgs)
+	matchArgs, linkNotes := pc.localPaths.expandNoted(argStrings)
+	views := buildArgViews(matchArgs)
+	if !checkInput {
+		for i := range views {
+			views[i].checkXargs = false
+		}
+	}
 
-	var matchedRules []string
+	var matchedRules, incompleteRules []string
 	strictest := ""
 	redirectProfile := ""
 	var resolutionPolicy config.DeferResolutionPolicy
@@ -311,10 +334,7 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 		// arguments are unavailable, skip best-effort pattern-only rules rather
 		// than falling back to unscoped matching; structural validators need raw
 		// JSON, so they fail closed instead.
-		ruleTokens, ruleJoined := tokens, joined
-		ruleAltTokens, ruleAltJoined := altTokens, altJoined
-		ruleBaseTokens, ruleBaseJoined := baseTokens, baseJoined
-		ruleRawTokens, ruleRawJoined := rawTokens, rawJoined
+		ruleViews := views
 		patchInspection := patchTargetsOrdinary
 		patchFallbackArgs := argStrings
 		credentialDestinations := argStrings
@@ -333,10 +353,7 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 			patchFallbackArgs = scopedStrings
 			credentialDestinations = scopedStrings
 			linkNotes = appendUniqueNotes(linkNotes, scopedNotes)
-			ruleTokens, ruleJoined = normalizeArgTokens(scopedStrings, normalize.ForMatching, policyPreNormalize)
-			ruleAltTokens, ruleAltJoined = normalizeArgTokens(scopedStrings, normalize.ForPolicy, policyPreNormalize)
-			ruleBaseTokens, ruleBaseJoined = normalizeArgTokens(scopedStrings, normalize.ForMatching, nil)
-			ruleRawTokens, ruleRawJoined = literalArgTokens(scopedStrings)
+			ruleViews = buildArgViews(scopedStrings)
 		}
 		if rule.ArgSource == config.ToolPolicyArgSourcePatchTargets {
 			patchTargets, inspection := extractPatchTargetPaths(argStrings)
@@ -346,31 +363,39 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 				linkNotes = appendUniqueNotes(linkNotes, patchNotes)
 				matchStrings := patchTargetMatchStrings(patchFallbackArgs, expandedTargets)
 				credentialDestinations = matchStrings
-				ruleTokens, ruleJoined = normalizeArgTokens(matchStrings, normalize.ForMatching, policyPreNormalize)
-				ruleAltTokens, ruleAltJoined = normalizeArgTokens(matchStrings, normalize.ForPolicy, policyPreNormalize)
-				ruleBaseTokens, ruleBaseJoined = normalizeArgTokens(matchStrings, normalize.ForMatching, nil)
-				ruleRawTokens, ruleRawJoined = literalArgTokens(matchStrings)
+				ruleViews = buildArgViews(matchStrings)
 			}
 		}
 
-		argPatternMatched := patchInspection == patchTargetsUninspectable || rule.ArgPattern == nil ||
-			matchArgPattern(rule.ArgPattern, ruleTokens, ruleJoined) ||
-			matchArgPattern(rule.ArgPattern, ruleAltTokens, ruleAltJoined) ||
-			matchArgPattern(rule.ArgPattern, ruleBaseTokens, ruleBaseJoined) ||
-			matchArgPattern(rule.ArgPattern, ruleRawTokens, ruleRawJoined)
+		argPatternMatched := patchInspection == patchTargetsUninspectable || rule.ArgPattern == nil
+		pairIncomplete := false
+		if !argPatternMatched {
+			argPatternMatched, pairIncomplete = matchArgViews(rule.ArgPattern, ruleViews[:]...)
+		}
 		// The shipped credential exception describes one submitted value. JSON
 		// keys and local aliases are not additional arguments to that value.
 		// Keep the shared pairwise matcher unchanged for every other rule and
 		// for calls with more than one string value.
 		if matched, handled := pc.matchSingleCredentialArgument(rule, argStrings, rawArgs); handled {
-			argPatternMatched = matched
+			argPatternMatched, pairIncomplete = matched, false
 		}
 		if patchInspection != patchTargetsUninspectable {
 			if matched, handled := pc.matchCredentialDestinations(rule, credentialDestinations); handled {
-				argPatternMatched = matched
+				argPatternMatched, pairIncomplete = matched, false
 			}
 		}
 		if !argPatternMatched {
+			if pairIncomplete {
+				// The rule could still match on a pair the bounded scan did
+				// not reach. Report that only if the rest of the rule holds.
+				structuralMatched, uninspectable := rule.matchStructuralValidators(rawArgs)
+				if uninspectable {
+					return uninspectableJSONDepthVerdict()
+				}
+				if structuralMatched {
+					incompleteRules = append(incompleteRules, rule.Name)
+				}
+			}
 			continue
 		}
 
@@ -403,6 +428,12 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 		}
 	}
 
+	if len(incompleteRules) > 0 {
+		matchedRules = append(matchedRules, incompletePairCheckRule)
+		strictest = StricterAction(strictest, pc.incompleteAction())
+		linkNotes = append(linkNotes, "could not rule out a match across every token pair for: "+strings.Join(incompleteRules, ", "))
+	}
+
 	if len(matchedRules) == 0 {
 		return Verdict{}
 	}
@@ -422,7 +453,16 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 		RedirectProfile:  redirectProfile,
 		ResolutionPolicy: resolutionPolicy,
 		Notes:            linkNotes,
+		IncompleteRules:  incompleteRules,
 	}
+}
+
+// incompleteAction is the action for an incomplete pairwise check.
+func (pc *Config) incompleteAction() string {
+	if pc.IncompleteAction == config.ActionBlock {
+		return config.ActionBlock
+	}
+	return config.ActionWarn
 }
 
 func appendUniqueNotes(notes, more []string) []string {
@@ -483,49 +523,10 @@ var pathSeparatorRunRe = regexp.MustCompile(`(^|[^:/])/(?:\.?/)+`)
 // `..` segments are left alone: the path rules match protected namespaces as
 // segments anywhere in the value, so a traversal spelling still matches.
 func collapsePathSeparators(s string) string {
+	if !strings.Contains(s, "/") {
+		return s
+	}
 	return pathSeparatorRunRe.ReplaceAllString(s, "${1}/")
-}
-
-// maxPairwiseTokens caps token count for O(n²) pairwise matching.
-// Kept at 64 to bound worst-case regex work (~4K pairs × rules).
-// Higher values create DoS risk (256 tokens = ~2M regex matches).
-const maxPairwiseTokens = 64
-
-// matchArgPattern checks if a regex pattern matches against any view of the
-// argument tokens. It uses three strategies:
-//  1. Full joined string (fast path for ordered arrays)
-//  2. Individual tokens (catches self-contained patterns like file paths)
-//  3. Pairwise token combinations (catches map-ordering evasion where command
-//     and flags end up in separate tokens with non-deterministic iteration order)
-//
-// literalArgTokens returns the submitted strings unmodified, each as one
-// token, and their space-joined form.
-func literalArgTokens(args []string) ([]string, string) {
-	return args, strings.Join(args, " ")
-}
-
-func matchArgPattern(pat *regexp.Regexp, tokens []string, joined string) bool {
-	if pat.MatchString(joined) {
-		return true
-	}
-	for _, t := range tokens {
-		if pat.MatchString(t) {
-			return true
-		}
-	}
-	// Pairwise: check "A B" and "B A" for every distinct pair.
-	// Typical arg lists have 3-10 tokens, so this is 6-90 checks - negligible cost.
-	// Capped at maxPairwiseTokens to prevent DoS from adversarial inputs.
-	if len(tokens) <= maxPairwiseTokens {
-		for i, a := range tokens {
-			for j, b := range tokens {
-				if i != j && pat.MatchString(a+" "+b) {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 const (
@@ -1191,14 +1192,11 @@ func (pc *Config) checkSingle(line []byte) Verdict {
 	var argStrings []string
 	hasArgs := len(tc.Arguments) > 0 && string(tc.Arguments) != jsonrpc.Null
 	if hasArgs {
-		// Use values-only extraction (not extractAllStringsFromJSON which
-		// includes map keys). Keys like "cmd","flags","target" would pollute
-		// the joined string and break regex adjacency for policy matching.
-		extracted := jsonrpc.ExtractStringsFromJSONResult(tc.Arguments)
-		if extracted.Truncated {
+		var truncated bool
+		argStrings, truncated = ArgValues(tc.Arguments)
+		if truncated {
 			return uninspectableJSONDepthVerdict()
 		}
-		argStrings = extracted.Strings
 	}
 
 	// If any rule uses ArgKey or structural validators, pass raw arguments so
@@ -1214,6 +1212,58 @@ func (pc *Config) checkSingle(line []byte) Verdict {
 	}
 
 	return pc.CheckToolCallWithArgs(tc.Name, argStrings, rawArgs)
+}
+
+// ArgValues returns the string values of JSON arguments, in sorted-key
+// order, without object keys. This is the list the MCP proxy matches. Keys
+// like "cmd", "flags", or "target" would pollute the joined string, break
+// regex adjacency, and add tokens toward maxPairwiseTokens.
+// truncated reports content past the nesting cap; callers fail closed.
+func ArgValues(raw json.RawMessage) (values []string, truncated bool) {
+	extracted := jsonrpc.ExtractStringsFromJSONResult(raw)
+	return extracted.Strings, extracted.Truncated
+}
+
+// CheckToolCallJSON checks tool policy for JSON arguments on the hook and
+// scan API paths. It matches the string values on their own, as the MCP
+// proxy does, so object keys cannot change how a command is matched, and it
+// matches the keys with the values, so text sent as an object key is still
+// checked. withKeys is the key and value list those paths extract for DLP.
+func (pc *Config) CheckToolCallJSON(toolName string, values, withKeys []string, rawArgs json.RawMessage) Verdict {
+	v := pc.CheckToolCallWithArgs(toolName, values, rawArgs)
+	if slices.Equal(values, withKeys) {
+		return v
+	}
+	// Keys are still scanned for rule matches, but they aren't runtime argv.
+	// Input provenance is assessed on values above; adding JSON keys must not
+	// turn a proved command string into an unknown argument array.
+	return mergeVerdicts(v, pc.checkToolCallWithArgs(toolName, withKeys, rawArgs, false))
+}
+
+// mergeVerdicts combines two verdicts for one call. The stricter action wins
+// and keeps its redirect profile and resolution policy; rules and notes from
+// both are kept once each, in order.
+func mergeVerdicts(a, b Verdict) Verdict {
+	if !b.Matched {
+		return a
+	}
+	if !a.Matched {
+		return b
+	}
+	out := a
+	if StricterAction(a.Action, b.Action) != a.Action {
+		out = b
+	}
+	out.Rules = nil
+	for _, r := range append(slices.Clone(a.Rules), b.Rules...) {
+		out.Rules = appendUniqueRule(out.Rules, r)
+	}
+	out.Notes = appendUniqueNotes(slices.Clone(a.Notes), b.Notes)
+	out.IncompleteRules = nil
+	for _, r := range append(slices.Clone(a.IncompleteRules), b.IncompleteRules...) {
+		out.IncompleteRules = appendUniqueRule(out.IncompleteRules, r)
+	}
+	return out
 }
 
 // uninspectableJSONDepthVerdict is the synthetic block returned when policy
@@ -1300,7 +1350,7 @@ func (pc *Config) checkBatch(line []byte) Verdict {
 		return Verdict{}
 	}
 
-	var allRules []string
+	var allRules, allNotes, allIncomplete []string
 	strictest := ""
 	redirectProfile := ""
 	var resolutionPolicy config.DeferResolutionPolicy
@@ -1309,6 +1359,10 @@ func (pc *Config) checkBatch(line []byte) Verdict {
 		v := pc.checkSingle(elem)
 		if v.Matched {
 			allRules = append(allRules, v.Rules...)
+			allNotes = appendUniqueNotes(allNotes, v.Notes)
+			for _, rule := range v.IncompleteRules {
+				allIncomplete = appendUniqueRule(allIncomplete, rule)
+			}
 			prev := strictest
 			strictest = StricterAction(strictest, v.Action)
 			// Track redirect profile from the verdict that set the effective action.
@@ -1337,6 +1391,8 @@ func (pc *Config) checkBatch(line []byte) Verdict {
 		Matched:          true,
 		Action:           strictest,
 		Rules:            allRules,
+		Notes:            allNotes,
+		IncompleteRules:  allIncomplete,
 		RedirectProfile:  redirectProfile,
 		ResolutionPolicy: resolutionPolicy,
 	}
@@ -1457,6 +1513,11 @@ func decodeShellEscapes(s string) string {
 // Iterates until no further changes occur, bounded to prevent infinite loops
 // on pathological input.
 func resolveShellConstruction(s string) string {
+	// Every replacement consumes a dollar-prefixed expansion. Assignments
+	// alone are unchanged, even when their values contain shell punctuation.
+	if !strings.Contains(s, "$") {
+		return s
+	}
 	const maxIterations = 10
 	for range maxIterations {
 		prev := s
@@ -1573,13 +1634,13 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 		{
 			Name:        "Destructive File Delete",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)\brm\s+(--\s+)?(-[a-z]*[rf]\b|--(?:recursive|force)\b)`,
+			ArgPattern:  `(?i)\brm(?:\s+[^\s;|&]+)*?\s+(-[a-z]*[rf][a-z]*\b|--(?:recursive|force)\b)`,
 			Action:      config.ActionBlock,
 		},
 		{
 			Name:        "Recursive Permission Change",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)\b(chmod\s+(-R|--recursive)\s+(777|666)|chmod\s+(777|666)\s+(-R|--recursive)|chown\s+(-R|--recursive))\b`,
+			ArgPattern:  `(?i)\b(chmod(?:\s+[^\s;|&]+)*?\s+(-[a-z]*r[a-z]*|--recursive)(?:\s+[^\s;|&]+)*?\s+(0?(?:777|666)|(?:[ugoa]*[+=-][rwxXst]*,)*[ugo]*[ao][ugoa]*[+=][rwxXst]*w[rwxXst]*(?:,[ugoa]*[+=-][rwxXst]*)*)|chmod(?:\s+[^\s;|&]+)*?\s+(0?(?:777|666)|(?:[ugoa]*[+=-][rwxXst]*,)*[ugo]*[ao][ugoa]*[+=][rwxXst]*w[rwxXst]*(?:,[ugoa]*[+=-][rwxXst]*)*)(?:\s+[^\s;|&]+)*?\s+(-[a-z]*r[a-z]*|--recursive)|chown(?:\s+[^\s;|&]+)*?\s+(-[a-z]*r[a-z]*|--recursive))\b`,
 		},
 		{
 			// Move and copy are matched unscoped, so the credential matches on the
@@ -1621,12 +1682,12 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 			// --form (-F, multipart), --upload-file (-T), explicit POST,
 			// wget's --post-data / --post-file / --body-data / --body-file.
 			// round-4 of the pre-tag gate found `curl --form` bypassed the earlier pattern.
-			ArgPattern: `(?i)\b(curl|wget)\b.*(-d\s|-F\s|-T\s|--data(?:-binary|-raw|-urlencode)?\b|--form\b|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b|-X\s+POST)`,
+			ArgPattern: `(?i)\b(curl|wget)\b.*(-d\s|-F\s|-T\s|--data(?:-binary|-raw|-urlencode)?\b|--form\b|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b|-X\s+POST|--json\b|--form-string\b)|\bcurl\b.*\s(?-i:-[a-zA-Z0-9]+[dFT])`,
 		},
 		{
 			Name:        "Reverse Shell",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e)`,
+			ArgPattern:  `(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e|\b(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+-[a-z0-9]*e\b|\b(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+((?-i:-[a-z0-9]*c)\b|--(?:sh-|lua-)?exec\b)|\bbash(?:\s+-[a-z]+)*?\s+-[a-z]*i[a-z]*(?:\s+-[a-z]+)*?\s+>&|/dev/udp/)`,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1653,24 +1714,24 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 		{
 			Name:        "Disk Wipe Command",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)\b(dd\s+if=.*of=/dev/|mkfs\.|fdisk)\b`,
+			ArgPattern:  `(?i)\b(dd\b.*of=/dev/|mkfs\.|fdisk|sfdisk|mke2fs|blkdiscard|mkfs(?:\s+[^\s;|&]+)*?\s+(?:-t|/dev/)|wipefs(?:\s+[^\s;|&]+)*?\s+(?:-[a-z]*[ao][a-z]*|--all|--offset)|sgdisk(?:\s+[^\s;|&]+)*?\s+(?:-[a-z]*z[a-z]*|--zap(?:-all)?))\b`,
 			Action:      config.ActionBlock,
 		},
 		{
 			Name:        "Package Install",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)\b(pip|npm|gem|cargo|go)\s+install\b`,
+			ArgPattern:  `(?i)\b(pip3?|npm|gem|cargo|go)(?:\s+-[^\s;|&]*(?:\s+[^-\s;|&][^\s;|&]*)?)*\s+install\b|\b(npm|pnpm|yarn|bun)(?:\s+-[^\s;|&]*(?:\s+[^-\s;|&][^\s;|&]*)?)*\s+(i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|add)\b|\b(uv|poetry|cargo)(?:\s+-[^\s;|&]*(?:\s+[^-\s;|&][^\s;|&]*)?)*\s+add\b`,
 		},
 		{
 			Name:        "Destructive Git Operation",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|git)$`,
-			ArgPattern:  `(?i)(\bgit\s+)?(push\s+(--force(\s|$)|-f\b)|reset\s+--hard\b|clean\s+-fd\b)`,
+			ArgPattern:  `(?i)(\bgit\s+)?(push(?:\s+[^\s;|&]+)*?\s+(--force(?:[\s;&|()<>]|$)|-[a-z]*f[a-z]*\b|\+[^\s;|&]+)|reset(?:\s+[^\s;|&]+)*?\s+--hard\b|clean(?:\s+[^\s;|&]+)*?\s+(-[a-z]*(f[a-z]*d|d[a-z]*f)[a-z]*\b|-[a-z]*f[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*d[a-z]*\b|-[a-z]*d[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*f[a-z]*\b))`,
 			Action:      config.ActionBlock,
 		},
 		{
 			Name:        "Encoded Command Execution",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)(\beval\b.*\bbase64\b|\bbase64\s+(-d|--decode)\b.*\|\s*(ba)?sh\b)`,
+			ArgPattern:  `(?i)(\beval\b.*\bbase64\b|\bbase64(?:\s+[^\s;|&]+)*?\s+(-[a-z]*d[a-z]*|--decode)\b.*\|\s*(?:(?:sudo|env|exec|command)(?:\s+[^\s;|&]+)*?\s+)?(?:[^\s;|&]*/)?((ba)?sh|zsh|dash|ksh|mksh)\b)`,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1755,7 +1816,7 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 		{
 			Name:        "Detached Process Spawning",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux\s+(new-session|new)\s+-d)`,
+			ArgPattern:  `(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux(?:\s+[^\s;|&]+)*?\s+(new-session|new)(?:\s+[^\s;|&]+)*?\s+-[a-z]*d)`,
 		},
 		{
 			// Move tools are deliberately unscoped and therefore protect both source
