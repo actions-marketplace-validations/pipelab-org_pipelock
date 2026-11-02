@@ -1030,6 +1030,8 @@ func TestMCPRemediationReasonPrerequisites(t *testing.T) {
 		{AuditMCPProtocol, "MCP batch responses are unsupported", "correct the upstream server", true},
 		{AuditMCPProtocol, "MCP listener admission refused", "listener_require_state_token", true},
 		{AuditMCPProtocol, "MCP listener protocol refused", "no scanner or policy setting relaxes protocol validation", true},
+		{AuditMCPProtocol, "MCP bridge routed notification refused", "non-null", true},
+		{AuditMCPProtocol, "MCP bridge re-initialize refused", "new bridge", true},
 		{AuditMCPProtocol, "MCP listener state capacity exhausted", "Retry after an existing state expires", true},
 		{AuditMCPProtocol, "MCP listener client-registry capacity exhausted (4096 clients); wait for listener idle expiry (24h) or session end", "does not raise this registry limit", true},
 		{AuditMCPProtocol, "session capacity exhausted; wait for session recovery or increase max_sessions", "session_profiling.max_sessions", true},
@@ -1093,6 +1095,39 @@ func TestQueryEntropyKeyHint(t *testing.T) {
 				t.Errorf("hint %q recommends a parameter exclusion that cannot lift a key block", hint)
 			}
 		})
+	}
+}
+
+func TestParserBodySizeGuidance(t *testing.T) {
+	for _, reason := range []string{
+		"request body exceeds max_body_bytes (1024)",
+		"multipart headers exceed max_body_bytes (1024)",
+		"multipart part exceeds max_body_bytes (1024)",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			got, ok := GuidanceForResult(ScannerParser, reason)
+			if !IsUnreadBodyReason(reason) {
+				t.Fatal("size refusal did not reach reason-specific body hints")
+			}
+			if !ok || !strings.Contains(got.OperatorKnob, "`request_body_scanning.max_body_bytes`") ||
+				!strings.Contains(got.OperatorKnob, "regardless of `request_body_scanning.action`") ||
+				got.AgentReason != protectiveCeilingAgentReason {
+				t.Fatalf("size-limit guidance = %#v, found %v", got, ok)
+			}
+			if hint := OperatorHintForResult(ScannerParser, reason); hint != got.OperatorKnob {
+				t.Fatalf("audit hint = %q, want %q", hint, got.OperatorKnob)
+			}
+		})
+	}
+	for _, reason := range []string{
+		"invalid JSON request body",
+		"error reading request body: request body exceeds max_body_bytes (1024)",
+		"multipart body exceeds 100 parts limit",
+	} {
+		got, ok := GuidanceForResult(ScannerParser, reason)
+		if !ok || got.OperatorKnob != parseContextOperatorKnob {
+			t.Fatalf("ordinary parser guidance for %q = %#v, found %v", reason, got, ok)
+		}
 	}
 }
 

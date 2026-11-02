@@ -4,6 +4,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -195,21 +196,31 @@ type sizeExemptScanRelease func()
 
 func noopSizeExemptScanRelease() {}
 
-func (b *sizeExemptScanBudget) readBoundedSizeExemptResponse(host string, prefix []byte, body io.Reader, scanMaxBytes, inflightMaxBytes int, rem sizeRemedies) ([]byte, sizeExemptScanRelease, *sizeExemptResponseReadError) {
-	ceiling := int64(scanMaxBytes)
-	if ceiling <= 0 {
-		ceiling = int64(config.DefaultSizeExemptScanMaxBytes)
+// sizeExemptScanCeiling is the per-response reservation a bounded read charges.
+func sizeExemptScanCeiling(scanMaxBytes int) int64 {
+	if scanMaxBytes <= 0 {
+		return int64(config.DefaultSizeExemptScanMaxBytes)
 	}
+	return int64(scanMaxBytes)
+}
+
+// sizeExemptScanInflightLimit is the shared budget every reservation draws from.
+func sizeExemptScanInflightLimit(inflightMaxBytes int) int64 {
+	if inflightMaxBytes <= 0 {
+		return int64(config.DefaultSizeExemptScanMaxInflightBytes)
+	}
+	return int64(inflightMaxBytes)
+}
+
+func (b *sizeExemptScanBudget) readBoundedSizeExemptResponse(host string, prefix []byte, body io.Reader, scanMaxBytes, inflightMaxBytes int, rem sizeRemedies) ([]byte, sizeExemptScanRelease, *sizeExemptResponseReadError) {
+	ceiling := sizeExemptScanCeiling(scanMaxBytes)
 	if ceiling == math.MaxInt64 {
 		return nil, noopSizeExemptScanRelease, &sizeExemptResponseReadError{
 			Kind:   sizeExemptReadFailureReadError,
 			Reason: "size-exempt response scan ceiling must leave room for one probe byte",
 		}
 	}
-	inflightLimit := int64(inflightMaxBytes)
-	if inflightLimit <= 0 {
-		inflightLimit = int64(config.DefaultSizeExemptScanMaxInflightBytes)
-	}
+	inflightLimit := sizeExemptScanInflightLimit(inflightMaxBytes)
 	if !b.reserveSizeExemptScanBytes(ceiling, inflightLimit) {
 		return nil, noopSizeExemptScanRelease, &sizeExemptResponseReadError{
 			Kind:   sizeExemptReadFailureInflight,
@@ -564,16 +575,27 @@ func bodyBlockCauseLabel(cause bodyBlockCause, current string) string {
 	return current
 }
 
-// unreadHoldOnly is an enforced unread-file hold, or a body withheld for its
-// Content-Encoding, with no credential, injection, entropy, address, or
-// redaction finding. Those findings keep their own labels. The hold reuses the
-// parser layer, whose block reason is parse_error: the published code for input
-// that could not be fully scanned.
-func unreadHoldOnly(result BodyScanResult) bool {
-	unread := result.UnscannedEncoding || (result.FileInspectionBlock && result.FileInspectionIncomplete != "")
-	return unread && len(result.DLPMatches) == 0 && len(result.InjectionMatches) == 0 &&
+// bodyParserFailureOnly identifies input that could not be fully scanned,
+// without a credential, injection, entropy, address, or redaction finding. A nil
+// body is the fail-closed scanRequestBody contract for unreadable, oversized,
+// or malformed input. These failures use the existing parser/parse_error labels.
+func bodyParserFailureOnly(result BodyScanResult, bodyBytes []byte) bool {
+	unread := !result.Clean && bodyBytes == nil || result.UnscannedEncoding || (result.FileInspectionBlock && result.FileInspectionIncomplete != "")
+	return unread && result.ScanError == "" && len(result.DLPMatches) == 0 && len(result.InjectionMatches) == 0 &&
 		len(result.AddressFindings) == 0 && result.EntropyFinding == nil &&
 		result.RedactionBlockReason == ""
+}
+
+// bodyFailureLayer keeps scanner failures distinct from malformed or unread input.
+// Both retain the existing fail-closed body verdict and public parse_error reason.
+func bodyFailureLayer(result BodyScanResult, bodyBytes []byte) string {
+	if result.ScanError != "" {
+		return scanner.ScannerContext
+	}
+	if bodyParserFailureOnly(result, bodyBytes) {
+		return scanner.ScannerParser
+	}
+	return ""
 }
 
 // recordIncompleteFileObservation emits the body-DLP audit event and counter
@@ -638,6 +660,8 @@ func (r BodyScanResult) IsEntropyOnly() bool {
 
 // BodyScanResult describes the outcome of scanning a request body or headers.
 type BodyScanResult struct {
+	// ScanError preserves ResponseScanResult.ScanError for incomplete scans.
+	ScanError string
 	// FileInspectionIncomplete names a recognized upload that was not fully read.
 	FileInspectionIncomplete string
 	// FileInspectionBlock is set only for enforced request-body block policy.
@@ -902,7 +926,9 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 			// No allow is collected here: redaction may rewrite the credential
 			// before forwarding, and a credential that survives redaction is
 			// collected again by the post-redaction scan below.
-			preRedactionDLP = scanBodyTextViewsForDLPWithAudience(ctx, req.Scanner, bodyDLPViews{texts: extracted.Texts, cards: extracted.CardTexts, atoms: extracted.Atoms, rawJSON: bodyJSONCardView(buf, extracted.Atoms)}, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, onDropped, audienceSurface, nil)
+			for _, view := range bodyDLPExtractionViews(buf, extracted, nil) {
+				preRedactionDLP = append(preRedactionDLP, scanBodyTextViewsForDLPWithAudience(ctx, req.Scanner, view, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, onDropped, audienceSurface, nil)...)
+			}
 			preRedactionDLP = append(preRedactionDLP, scanProviderOpaqueTextsForDLPWithAudience(ctx, req.Scanner, extracted.ProviderOpaqueTexts, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, onDropped, audienceSurface, nil)...)
 		}
 	}
@@ -993,14 +1019,17 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 			dlpExtracted.Atoms = append(dlpExtracted.Atoms, extract.DLPAtom{Text: text, Card: text})
 		}
 	}
-	texts := dlpExtracted.GenericTexts
+	// Multipart header tokens join the injection and address views; content
+	// entropy scores them one at a time below.
+	entropyTexts := dlpExtracted.GenericTexts
+	texts := append(slices.Clip(dlpExtracted.GenericTexts), dlpExtracted.HeaderTokens...)
 	if dnsInspection.Parsed {
 		dlpExtracted.Texts = append(dlpExtracted.Texts, dnsInspection.DLPTexts...)
 	}
 
-	// A multipart form with no parts can still carry a file in its preamble.
-	// Recovered file text and an unread file decide the result like any field.
-	if len(texts) == 0 && len(fileTexts) == 0 && fileIncomplete == "" {
+	// A multipart form with no parts can still carry text or a file in its
+	// preamble or epilogue. These decide the result like any field.
+	if len(texts) == 0 && len(dlpExtracted.Texts) == 0 && len(fileTexts) == 0 && fileIncomplete == "" {
 		if len(preRedactionDLP) > 0 {
 			return buf, BodyScanResult{
 				Clean:           false,
@@ -1027,7 +1056,10 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 
 	// Scan each extracted string individually (catches per-field encoded secrets).
 	disabledDLP := bodyDLPDisabledSet(req.DisablePatterns)
-	matches := scanBodyTextViewsForDLPWithAudience(ctx, req.Scanner, bodyDLPViews{texts: dlpExtracted.Texts, cards: dlpExtracted.CardTexts, atoms: dlpExtracted.Atoms, rawJSON: bodyJSONCardView(buf, dlpExtracted.Atoms)}, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, onDropped, audienceSurface, collectAudienceAllow)
+	var matches []scanner.TextDLPMatch
+	for _, view := range bodyDLPExtractionViews(buf, dlpExtracted, fileTexts) {
+		matches = append(matches, scanBodyTextViewsForDLPWithAudience(ctx, req.Scanner, view, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, onDropped, audienceSurface, collectAudienceAllow)...)
+	}
 	matches = append(matches, scanProviderOpaqueTextsForDLPWithAudience(ctx, req.Scanner, dlpExtracted.ProviderOpaqueTexts, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, onDropped, audienceSurface, collectAudienceAllow)...)
 	matches = uniqueBodyDLPMatches(matches)
 	if len(matches) > 0 {
@@ -1041,11 +1073,16 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 			action = config.StrongestAction(action, requestBodyDLPAction(preRedactionDLP, req.Action, req.PatternActions))
 		}
 	}
-	entropyTexts := texts
 	if dnsInspection.Parsed {
 		entropyTexts = dnsInspection.EntropyTexts
 	}
 	finding := scanBodyTextsForContentEntropy(entropyTexts, req)
+	for _, token := range dlpExtracted.HeaderTokens {
+		if finding != nil {
+			break
+		}
+		finding = scanBodyTextsForContentEntropy([]string{token}, req)
+	}
 	if finding != nil {
 		result.EntropyFinding = finding
 		result.EntropyAction = req.ContentEntropyAction
@@ -1058,7 +1095,7 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 	for _, text := range texts {
 		injectionResult := req.Scanner.ScanResponse(ctx, text)
 		if injectionResult.Failed() {
-			return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
+			return nil, BodyScanResult{Action: config.ActionBlock, ScanError: injectionResult.ScanError, Reason: "request body scan failed: " + injectionResult.ScanError}
 		}
 		if !injectionResult.Clean {
 			result.InjectionMatches = append(result.InjectionMatches, injectionResult.Matches...)
@@ -1073,7 +1110,7 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 	var inOrderInjection, sortedInjection []scanner.ResponseMatch
 	injectionResult := req.Scanner.ScanResponse(ctx, joinedInOrder)
 	if injectionResult.Failed() {
-		return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
+		return nil, BodyScanResult{Action: config.ActionBlock, ScanError: injectionResult.ScanError, Reason: "request body scan failed: " + injectionResult.ScanError}
 	}
 	if !injectionResult.Clean {
 		inOrderInjection = injectionResult.Matches
@@ -1085,16 +1122,34 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final 
 	joined := strings.Join(sorted, "\n")
 	injectionResult = req.Scanner.ScanResponse(ctx, joined)
 	if injectionResult.Failed() {
-		return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
+		return nil, BodyScanResult{Action: config.ActionBlock, ScanError: injectionResult.ScanError, Reason: "request body scan failed: " + injectionResult.ScanError}
 	}
 	if !injectionResult.Clean {
 		sortedInjection = injectionResult.Matches
+	}
+	// Tokens and regions must not interrupt a split phrase that a narrower
+	// view detects. Preserve the field-only joins and the token-bearing part
+	// reading without regions, as well as the complete reading above.
+	var fieldInjection []scanner.ResponseMatch
+	if len(dlpExtracted.HeaderTokens) > 0 || len(dlpExtracted.MultipartFields) > 0 {
+		joinedFields := []string{strings.Join(sortedBodyTexts(dlpExtracted.GenericTexts), "\n"), strings.Join(sortedBodyTexts(dlpExtracted.MultipartFields), "\n")}
+		if len(dlpExtracted.MultipartFields) > 0 {
+			partTexts := append(slices.Clip(dlpExtracted.MultipartFields), dlpExtracted.HeaderTokens...)
+			joinedFields = append(joinedFields, strings.Join(partTexts, "\n"), strings.Join(sortedBodyTexts(partTexts), "\n"))
+		}
+		for _, joinedFields := range joinedFields {
+			fieldResult := req.Scanner.ScanResponse(ctx, joinedFields)
+			if fieldResult.Failed() {
+				return nil, BodyScanResult{Action: config.ActionBlock, ScanError: fieldResult.ScanError, Reason: "request body scan failed: " + fieldResult.ScanError}
+			}
+			fieldInjection = mergeJoinedInjectionMatches(fieldInjection, fieldResult.Matches)
+		}
 	}
 	// The joined views re-read every field, so they repeat what the per-field
 	// scan already found. Keep every per-field match and add only the
 	// occurrences a joined view alone detected, such as a phrase split across
 	// fields.
-	result.InjectionMatches = mergeJoinedInjectionMatches(result.InjectionMatches, inOrderInjection, sortedInjection)
+	result.InjectionMatches = mergeJoinedInjectionMatches(result.InjectionMatches, inOrderInjection, sortedInjection, fieldInjection)
 
 	// Address poisoning detection alongside DLP.
 	// Note: body address findings are currently emitted/counted as body_dlp
@@ -1185,6 +1240,12 @@ type bodyDLPTextExtraction struct {
 	CardTexts           []string
 	Atoms               []extract.DLPAtom
 	GenericTexts        []string
+	MultipartFields     []string
+	MultipartRegions    bool
+	MultipartPreamble   []byte
+	MultipartEpilogue   []byte
+	DLPFieldGroups      [][]string
+	HeaderTokens        []string
 	Texts               []string
 	ProviderOpaqueTexts []string
 	Err                 string
@@ -1197,8 +1258,45 @@ func extractBodyTextForDLP(body []byte, req BodyScanRequest) bodyDLPTextExtracti
 			return bodyDLPTextExtraction{Err: "multipart/form-data missing boundary"}
 		}
 		var files [][]byte
-		texts, errText := extractMultipartWithFiles(body, params["boundary"], req.MaxBytes, func(part []byte) { files = append(files, part) })
-		return bodyDLPTextExtraction{GenericTexts: texts, Texts: texts, FileParts: files, Err: errText}
+		m, errText := extractMultipartWithFiles(body, params["boundary"], req.MaxBytes, func(part []byte) { files = append(files, part) })
+		if errText != "" {
+			return bodyDLPTextExtraction{Err: errText}
+		}
+		// RFC 2046 section 5.1.1 excludes preamble and epilogue bytes from
+		// parts, but a raw-body receiver still gets them. They are scanned
+		// like a part body, in wire order, by DLP (including its decoded
+		// views) and by the injection, entropy and address checks. Leaving
+		// either view out would let a one-line multipart envelope carry text
+		// that the same body sent as text/plain could not. Archive inspection
+		// of these regions is separate (inspectUploadTextViews).
+		preamble := multipartPreamble(body, params["boundary"])
+		epilogue, ok := multipartEpilogue(body, params["boundary"], len(preamble))
+		if !ok {
+			return bodyDLPTextExtraction{Err: "multipart parse error: cannot locate the closing delimiter"}
+		}
+		var regionTexts []string
+		if len(preamble) > 0 {
+			regionTexts = append(regionTexts, string(preamble))
+		}
+		regionTexts = append(regionTexts, m.Fields...)
+		if len(epilogue) > 0 {
+			regionTexts = append(regionTexts, string(epilogue))
+		}
+		// Regions and tokens supplement the existing part-field reading. Keep
+		// its sorted join free of either so they cannot interrupt a phrase.
+		hasRegions := len(preamble) > 0 || len(epilogue) > 0
+		var multipartFields []string
+		if hasRegions {
+			multipartFields = m.Fields
+		}
+		// Wire headers have their own DLP pass so they cannot interrupt the
+		// existing region-and-field join. Keep each group as fields until the
+		// scanner applies URL exceptions, before adding synthetic separators.
+		var fieldGroups [][]string
+		if len(m.Wire) > 0 {
+			fieldGroups = append(fieldGroups, m.Wire)
+		}
+		return bodyDLPTextExtraction{GenericTexts: regionTexts, MultipartFields: multipartFields, MultipartRegions: hasRegions, MultipartPreamble: preamble, MultipartEpilogue: epilogue, DLPFieldGroups: fieldGroups, HeaderTokens: m.Tokens, Texts: regionTexts, FileParts: files}
 	}
 	if mediaType != contentTypeJSON && !strings.HasSuffix(mediaType, "+json") {
 		texts, errText := extractBodyText(body, req)
@@ -1570,6 +1668,22 @@ type bodyDLPViews struct {
 	texts, cards []string
 	atoms        []extract.DLPAtom
 	rawJSON      string
+}
+
+func bodyDLPExtractionViews(body []byte, extracted bodyDLPTextExtraction, fileTexts []string) []bodyDLPViews {
+	views := []bodyDLPViews{{texts: extracted.Texts, cards: extracted.CardTexts, atoms: extracted.Atoms, rawJSON: bodyJSONCardView(body, extracted.Atoms)}}
+	for _, fields := range extracted.DLPFieldGroups {
+		views = append(views, bodyDLPViews{texts: fields})
+	}
+	// Multipart regions supplement the part reading: its fields and the text
+	// recovered from uploaded files. Keep that join without the regions so a
+	// preamble or epilogue cannot interrupt a split it detects.
+	if extracted.MultipartRegions {
+		if partTexts := slices.Concat(extracted.MultipartFields, fileTexts); len(partTexts) > 1 {
+			views = append(views, bodyDLPViews{texts: partTexts})
+		}
+	}
+	return views
 }
 
 func bodyJSONCardView(body []byte, atoms []extract.DLPAtom) string {
@@ -2183,42 +2297,90 @@ func extractFormURLEncoded(body []byte) ([]string, string) {
 // Returns extracted strings and an error message if any limit is exceeded.
 // On limit violation: fail-closed (returns error, caller blocks).
 func extractMultipart(body []byte, boundary string, maxBytes int) ([]string, string) {
-	return extractMultipartWithFiles(body, boundary, maxBytes, nil)
+	m, errText := extractMultipartWithFiles(body, boundary, maxBytes, nil)
+	return slices.Concat(m.Fields, m.Tokens, m.Wire), errText
 }
 
-func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPart func([]byte)) ([]string, string) {
-	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+// multipartText separates multipart texts by the request checks that read
+// them. Whole raw header sections and name+value joins are DLP-only: as one
+// string, ordinary upload headers exceed the default content-entropy
+// threshold. Header names, media or disposition types and parameter names
+// are tokens that injection and address checks read with the fields, because
+// injection scanning reads a phrase joined by hyphens or underscores. Content
+// entropy scores each token alone, since short structural tokens raise the
+// entropy of a joined view of ordinary form fields.
+type multipartText struct {
+	Fields []string
+	Tokens []string
+	Wire   []string
+}
 
-	var result []string
+func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPart func([]byte)) (multipartText, string) {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	remaining := body
+
+	var result, tokens, headerTexts []string
 	partCount := 0
 
 	for {
-		if partCount >= maxMultipartParts {
-			return nil, fmt.Sprintf("multipart body exceeds %d parts limit", maxMultipartParts)
-		}
-
 		part, err := reader.NextRawPart()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			// Parse error in multipart: fail-closed block.
-			return nil, fmt.Sprintf("multipart parse error: %v", err)
+			return multipartText{}, fmt.Sprintf("multipart parse error: %v", err)
 		}
 		partCount++
+		if partCount > maxMultipartParts {
+			return multipartText{}, fmt.Sprintf("multipart body exceeds %d parts limit", maxMultipartParts)
+		}
+
+		// Keep the wire spelling: textproto canonicalizes field names and
+		// mime.ParseMediaType lowercases parameter names. RFC 5322 section 2.2
+		// separates each field into its name, colon and value.
+		rawHeaders, partBytes, ok := rawMultipartHeaders(remaining, boundary)
+		if !ok {
+			return multipartText{}, "multipart parse error: cannot locate part headers"
+		}
+		if len(rawHeaders) > maxBytes {
+			return multipartText{}, fmt.Sprintf("multipart headers exceed max_body_bytes (%d)", maxBytes)
+		}
+		headerTexts = append(headerTexts, string(rawHeaders))
+		// As with outer request headers, also scan name+value without the
+		// field separator, so a credential split at the colon is inspected.
+		wire := textproto.NewReader(bufio.NewReader(bytes.NewReader(rawHeaders)))
+		for {
+			// ReadContinuedLine unfolds values without canonicalizing names.
+			line, err := wire.ReadContinuedLine()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return multipartText{}, fmt.Sprintf("multipart header read error: %v", err)
+			}
+			if name, value, found := strings.Cut(line, ":"); found {
+				tokens = append(tokens, name)
+				headerTexts = append(headerTexts, name+strings.TrimSpace(value))
+			}
+		}
+		// RFC 2045 section 6 defines one transfer mechanism per entity.
+		// Refuse receiver-dependent first/last-value interpretations, even
+		// when both values agree. RFC 7578 section 4.7 deprecates this field
+		// in forms, but a single legacy encoding remains supported.
+		if len(part.Header.Values("Content-Transfer-Encoding")) > 1 {
+			return multipartText{}, "multipart parse error: multiple Content-Transfer-Encoding headers"
+		}
 
 		// Extract metadata before closing the part.
 		formName := part.FormName()
 		filename := part.FileName()
 		if len(filename) > maxFilenameBytes {
-			return nil, fmt.Sprintf("multipart filename exceeds %d bytes", maxFilenameBytes)
+			return multipartText{}, fmt.Sprintf("multipart filename exceeds %d bytes", maxFilenameBytes)
 		}
 
-		// Scan ALL part headers for secret exfiltration.
-		// Custom headers (X-Secret, etc.) are scanned as raw values.
-		// Structural headers (Content-Type, Content-Disposition) are parsed
-		// for parameter values - an attacker can hide secrets in non-standard
-		// params like Content-Disposition: form-data; x-data="<credential>".
+		// Retain parsed values as well as wire headers, including decoded
+		// MIME parameter values that may not appear verbatim on the wire.
 		for name, values := range part.Header {
 			canonical := textproto.CanonicalMIMEHeaderKey(name)
 			if canonical == headerContentType || canonical == "Content-Disposition" {
@@ -2231,6 +2393,7 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 						result = append(result, v)
 						continue
 					}
+					tokens = append(tokens, multipartHeaderValueTokens(v)...)
 					for _, pv := range params {
 						result = append(result, pv)
 					}
@@ -2238,7 +2401,7 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 				continue
 			}
 			if canonical == "Content-Transfer-Encoding" {
-				continue // Pure token (base64/7bit), no params, no exfil surface.
+				continue // The raw field is already included above.
 			}
 			result = append(result, values...)
 		}
@@ -2251,11 +2414,14 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 		_ = part.Close()
 
 		if readErr != nil {
-			return nil, fmt.Sprintf("error reading multipart part: %v", readErr)
+			return multipartText{}, fmt.Sprintf("error reading multipart part: %v", readErr)
 		}
 		if len(partBody) > maxBytes {
-			return nil, fmt.Sprintf("multipart part exceeds max_body_bytes (%d)", maxBytes)
+			return multipartText{}, fmt.Sprintf("multipart part exceeds max_body_bytes (%d)", maxBytes)
 		}
+		// NextRawPart does not transfer-decode, so its consumed body length
+		// identifies the next delimiter in the original bytes exactly.
+		remaining = partBytes[len(partBody):]
 
 		// Decode Content-Transfer-Encoding before scanning. NextRawPart
 		// keeps CTE visible instead of transparently decoding quoted-printable,
@@ -2274,7 +2440,7 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 			}, rawBody)
 			decoded, err := base64.StdEncoding.DecodeString(cleaned)
 			if err != nil {
-				return nil, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
+				return multipartText{}, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
 			}
 			// Scan BOTH decoded (catches actual secrets) and raw
 			// (catches patterns visible in encoded form).
@@ -2285,11 +2451,11 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 			result = append(result, rawBody)
 		case "quoted-printable":
 			if err := validateQuotedPrintable(partBody); err != nil {
-				return nil, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
+				return multipartText{}, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
 			}
 			decoded, err := io.ReadAll(quotedprintable.NewReader(bytes.NewReader(partBody)))
 			if err != nil {
-				return nil, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
+				return multipartText{}, fmt.Sprintf("error decoding multipart part content-transfer-encoding %q: %v", cte, err)
 			}
 			result = append(result, string(decoded))
 			if onPart != nil {
@@ -2304,7 +2470,7 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 				result = append(result, rawBody)
 			}
 		default:
-			return nil, fmt.Sprintf("unsupported multipart part content-transfer-encoding %q", cte)
+			return multipartText{}, fmt.Sprintf("unsupported multipart part content-transfer-encoding %q", cte)
 		}
 
 		// Include field name and filename in extracted text (can carry exfil data).
@@ -2316,7 +2482,65 @@ func extractMultipartWithFiles(body []byte, boundary string, maxBytes int, onPar
 		}
 	}
 
-	return result, ""
+	return multipartText{Fields: result, Tokens: tokens, Wire: headerTexts}, ""
+}
+
+// multipartHeaderValueTokens keeps the wire case of a value already accepted
+// by mime.ParseMediaType. RFC 2045 section 5.1 permits semicolons and escaped
+// quotes inside quoted parameter values; only unquoted semicolons separate
+// parameters. Lowercasing tokens can conceal their original content entropy.
+func multipartHeaderValueTokens(value string) []string {
+	mediaType, rest, found := strings.Cut(value, ";")
+	tokens := []string{strings.TrimSpace(mediaType)}
+	if !found {
+		return tokens
+	}
+	addParameter := func(parameter string) {
+		if name, _, ok := strings.Cut(parameter, "="); ok {
+			tokens = append(tokens, strings.TrimSpace(name))
+		}
+	}
+	start := 0
+	quoted, escaped := false, false
+	for i := 0; i < len(rest); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case quoted && rest[i] == '\\':
+			escaped = true
+		case rest[i] == '"':
+			quoted = !quoted
+		case !quoted && rest[i] == ';':
+			addParameter(rest[start:i])
+			start = i + 1
+		}
+	}
+	addParameter(rest[start:])
+	return tokens
+}
+
+// rawMultipartHeaders locates the header section of a part already accepted by
+// mime/multipart. The caller advances past exactly the raw body bytes read from
+// that part. Reuse the delimiter rules in multipartPreamble (RFC 2046 section
+// 5.1.1), including transport padding and Go's LF-only compatibility mode.
+func rawMultipartHeaders(body []byte, boundary string) (headers, partBody []byte, ok bool) {
+	body = body[len(multipartPreamble(body, boundary)):]
+	_, body, found := bytes.Cut(body, []byte("\n"))
+	if !found {
+		return nil, nil, false
+	}
+	headers = body
+	for len(body) > 0 {
+		line, rest, found := bytes.Cut(body, []byte("\n"))
+		if !found {
+			break
+		}
+		if len(bytes.TrimSuffix(line, []byte("\r"))) == 0 {
+			return headers[:len(headers)-len(body)], rest, true
+		}
+		body = rest
+	}
+	return nil, nil, false
 }
 
 func validateQuotedPrintable(body []byte) error {

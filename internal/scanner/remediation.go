@@ -100,7 +100,14 @@ const UnscannedEncodingSuffix = "compressed bodies cannot be scanned for secrets
 // IsUnreadBodyReason reports a body Pipelock withheld because it could not read
 // it, not because a finding matched. Both share the parse_error block reason.
 func IsUnreadBodyReason(reason string) bool {
-	return strings.HasSuffix(reason, IncompleteFileGovernedSuffix) || strings.HasSuffix(reason, UnscannedEncodingSuffix)
+	return strings.HasSuffix(reason, IncompleteFileGovernedSuffix) || strings.HasSuffix(reason, UnscannedEncodingSuffix) || isBodySizeLimitReason(reason)
+}
+
+// isBodySizeLimitReason recognizes the size refusals emitted by request-body inspection.
+func isBodySizeLimitReason(reason string) bool {
+	return strings.HasPrefix(reason, "request body exceeds max_body_bytes (") ||
+		strings.HasPrefix(reason, "multipart headers exceed max_body_bytes (") ||
+		strings.HasPrefix(reason, "multipart part exceeds max_body_bytes (")
 }
 
 // Request-body reasons that name a finding before an unread upload. The
@@ -250,7 +257,7 @@ const (
 		"There is no allow knob — reach the intended service by its ordinary routable or private address instead."
 
 	injectionTraversalOperatorKnob = "This sequence is never legitimate in a normal URL (header injection / directory escape). There is no exemption knob — the URL must be corrected at the source."
-	parseContextOperatorKnob       = "This is not a policy block: the request context was unavailable/cancelled, or the URL could not be parsed. Correct the input and retry."
+	parseContextOperatorKnob       = "This is not a policy block: the request context was unavailable/cancelled, or the input could not be parsed or fully scanned. Correct the input or unreadable body and retry."
 
 	// Query entropy shares the ScannerEntropy label with path entropy
 	// but is a distinct gate with a distinct knob. The table is keyed by label
@@ -394,7 +401,7 @@ var remediationGuidance = map[string]RemediationGuidance{
 	},
 	ScannerParser: {
 		OperatorKnob: parseContextOperatorKnob,
-		AgentReason:  "Request blocked: the URL could not be parsed.",
+		AgentReason:  "Request blocked: the input could not be parsed or fully scanned.",
 	},
 	ScannerBodyDLP: {
 		OperatorKnob: bodyDLPOperatorKnob,
@@ -733,6 +740,10 @@ func guidanceForResult(label, reason string) (g RemediationGuidance, ok bool) {
 			return RemediationGuidance{OperatorKnob: "The MCP listener refused the exchange. Check the client's Origin, Host, listener credential, HTTP method and Pipelock session token against the listener configuration, including `mcp_session_binding.listener_require_state_token`.", Immutable: true, AgentReason: auditRuntimeAgentReason}, true
 		case "MCP listener protocol refused":
 			return RemediationGuidance{OperatorKnob: "The MCP listener refused a malformed or inconsistent request. Correct the client's MCP headers, protocol version or JSON-RPC body; no scanner or policy setting relaxes protocol validation.", Immutable: true, AgentReason: auditRuntimeAgentReason}, true
+		case "MCP bridge routed notification refused":
+			return RemediationGuidance{OperatorKnob: "Send the routed MCP method as a JSON-RPC request with a non-null id. No scanner or policy setting allows its notification form.", Immutable: true, AgentReason: auditRuntimeAgentReason}, true
+		case "MCP bridge re-initialize refused":
+			return RemediationGuidance{OperatorKnob: "Start a new bridge process before initializing again. A modern bridge keeps its negotiated header contract for its lifetime; no scanner or policy setting allows a second initialize.", Immutable: true, AgentReason: auditRuntimeAgentReason}, true
 		case "MCP listener client-registry capacity exhausted (4096 clients); wait for listener idle expiry (24h) or session end":
 			return RemediationGuidance{OperatorKnob: "The MCP listener reached its fixed 4,096-client registry limit. Retained clients free a slot on listener idle expiry (24h) or session end; increasing `session_profiling.max_sessions` does not raise this registry limit. Configure authenticated principal state to bind one principal to one slot.", Immutable: true, AgentReason: auditRuntimeAgentReason}, true
 		case "MCP listener state capacity exhausted":
@@ -777,6 +788,16 @@ func guidanceForResult(label, reason string) (g RemediationGuidance, ok bool) {
 	// reason so hot-path blocks such as URL length do not allocate a lowercase
 	// copy that no branch will inspect.
 	switch label {
+	case ScannerParser:
+		// These prefixes are emitted by request-body inspection when its
+		// configured read ceiling prevents complete scanning.
+		if isBodySizeLimitReason(reason) {
+			return RemediationGuidance{
+				OperatorKnob: "Reduce the request body size, or raise `request_body_scanning.max_body_bytes` only to the largest verified body this route needs. Bodies over this ceiling block regardless of `request_body_scanning.action`.",
+				AgentReason:  protectiveCeilingAgentReason,
+			}, true
+		}
+		return GuidanceFor(label)
 	case AuditKillSwitch:
 		if reason == "conductor_apply_failure" {
 			return RemediationGuidance{
