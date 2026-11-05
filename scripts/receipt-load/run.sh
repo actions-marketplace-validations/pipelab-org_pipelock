@@ -19,13 +19,18 @@ restart_args=()
 if [[ -n ${RECEIPT_LOAD_RESTART_AFTER:-} ]]; then
   restart_args=(--restart-after "$RECEIPT_LOAD_RESTART_AFTER")
 fi
+verify_args=()
+if [[ -n ${RECEIPT_LOAD_VERIFY_TIMEOUT:-} ]]; then
+  verify_args=(--verify-timeout "$RECEIPT_LOAD_VERIFY_TIMEOUT")
+fi
 go run ./scripts/receipt-load --binary "$repo/pipelock" --out "$1" \
   --requests "${RECEIPT_LOAD_REQUESTS:-1000000}" \
   --warmup "${RECEIPT_LOAD_WARMUP:-1000}" \
   --concurrency "${RECEIPT_LOAD_CONCURRENCY:-128}" \
   --chains "${RECEIPT_LOAD_CHAINS:-1}" \
+  --destinations "${RECEIPT_LOAD_DESTINATIONS:-single}" \
   --modes "${RECEIPT_LOAD_MODES:-off,best,required}" \
   --rules "${RECEIPT_LOAD_RULES:-empty}" \
   --seed "${RECEIPT_LOAD_SEED:-1}" \
   --window "${RECEIPT_LOAD_WINDOW:-5s}" \
-  ${lock_args[@]+"${lock_args[@]}"} ${restart_args[@]+"${restart_args[@]}"}
+  ${lock_args[@]+"${lock_args[@]}"} ${restart_args[@]+"${restart_args[@]}"} ${verify_args[@]+"${verify_args[@]}"}

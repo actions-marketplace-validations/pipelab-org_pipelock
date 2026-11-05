@@ -15,9 +15,10 @@ const (
 	// synthetic credential and must be blocked; the rest must be allowed.
 	blockEvery = 20
 
-	// workloadKeyParam is the query parameter that carries the per-request
-	// workload key. A query value survives receipt target sanitation as long
-	// as it is DLP-clean, which keeps the key readable in v1 and v2 receipts.
+	// workloadKeyParam binds each origin request to the plan. Destination-only
+	// receipts drop this query key; per-request destinations restore identity.
+	// Single-destination receipts use aggregate accounting instead;
+	// historical receipts that retain the key can still use identity checks.
 	workloadKeyParam   = "wk"
 	workloadPath       = "/ok"
 	workloadTransport  = "forward"
@@ -33,11 +34,12 @@ const fakeToken = "ghp_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 // has a unique non-secret key; all expectations (sink, receipts, response
 // class) are derived from the plan rather than from observed counts.
 type workload struct {
-	runNonce    string
-	seed        uint64
-	warmup      int
-	measured    int
-	blockOffset int
+	destinations *destinationPlan
+	runNonce     string
+	seed         uint64
+	warmup       int
+	measured     int
+	blockOffset  int
 }
 
 func newWorkload(seed uint64, warmup, measured int) workload {

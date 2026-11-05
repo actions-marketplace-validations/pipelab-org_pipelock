@@ -37,7 +37,8 @@ type expectedReceipts [kindCount]int32
 //     ActionID, one v2 receipt per phase, and one AEL activity per phase.
 //
 // The v2 receipt drops ActionID and phase by design, so its expected count is
-// the number of v1 receipts the request leaves, matched through the key only.
+// the number of v1 receipts the request leaves. Per-request destinations bind
+// those observations to a request but cannot distinguish intent from outcome.
 func expectedFor(mode string, blocked bool) expectedReceipts {
 	var e expectedReceipts
 	switch {
@@ -120,19 +121,20 @@ func (h *headerReport) noteProblem(text string) {
 
 // integrityReport is the integrity verdict and the accounting behind it.
 type integrityReport struct {
-	Verdict           string                `json:"verdict"`
-	Reasons           []string              `json:"reasons"`
-	Kinds             map[string]kindReport `json:"kinds"`
-	Sink              kindReport            `json:"sink"`
-	ReceiptHeader     headerReport          `json:"receipt_header"`
-	ReceiptMissing    int                   `json:"receipt_missing"`
-	AmbiguousRequests int                   `json:"ambiguous_requests"`
-	ControlReceipts   int                   `json:"control_receipts"`
-	RecorderFiles     int                   `json:"recorder_files"`
-	AELFiles          int                   `json:"ael_files"`
-	OrphanSamples     []string              `json:"orphan_samples,omitempty"`
-	Shutdown          shutdownReport        `json:"shutdown"`
-	Verify            verifyReport          `json:"verify"`
+	Verdict            string                `json:"verdict"`
+	ReceiptAttribution string                `json:"receipt_attribution,omitempty"`
+	Reasons            []string              `json:"reasons"`
+	Kinds              map[string]kindReport `json:"kinds"`
+	Sink               kindReport            `json:"sink"`
+	ReceiptHeader      headerReport          `json:"receipt_header"`
+	ReceiptMissing     int                   `json:"receipt_missing"`
+	AmbiguousRequests  int                   `json:"ambiguous_requests"`
+	ControlReceipts    int                   `json:"control_receipts"`
+	RecorderFiles      int                   `json:"recorder_files"`
+	AELFiles           int                   `json:"ael_files"`
+	OrphanSamples      []string              `json:"orphan_samples,omitempty"`
+	Shutdown           shutdownReport        `json:"shutdown"`
+	Verify             verifyReport          `json:"verify"`
 }
 
 type shutdownReport struct {
@@ -165,10 +167,21 @@ type integrityInput struct {
 // evaluateIntegrity compares what each planned request should have left
 // behind with what the recorder and the sink actually hold, by identity.
 func evaluateIntegrity(in integrityInput) integrityReport {
+	if in.plan.destinations == nil && in.obs != nil && in.obs.aggregate != nil {
+		return evaluateAggregateIntegrity(in)
+	}
 	rep := integrityReport{Verdict: verdictPass, Kinds: make(map[string]kindReport, kindCount), Reasons: []string{}}
+	// Off mode leaves no receipts, so there is nothing to attribute, matching
+	// the single-destination workload.
+	if in.plan.destinations != nil && in.mode != modeOff {
+		rep.ReceiptAttribution = attributionPerRequestDestination
+	}
 	obs := in.obs
 	if obs == nil {
 		obs = newRecorderObservation(in.plan.total())
+	}
+	if in.plan.destinations != nil && obs.aggregate != nil {
+		rep.fail("per-request destinations contain aggregate observations")
 	}
 	if in.mode == modeOff && (obs.controlReceipts > 0 || obs.recorderFiles > 0 || obs.aelFiles > 0 || obs.totalFiles > 0) {
 		rep.fail("off mode contains recorder evidence")

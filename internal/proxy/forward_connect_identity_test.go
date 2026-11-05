@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -38,7 +39,7 @@ func installConnectDialRecorder(t *testing.T, p *Proxy) (*atomic.Int32, <-chan s
 
 	var calls atomic.Int32
 	targets := make(chan string, 1)
-	p.dialer.ControlContext = func(_ context.Context, _ string, address string, _ syscall.RawConn) error {
+	p.dialer.(*net.Dialer).ControlContext = func(_ context.Context, _ string, address string, _ syscall.RawConn) error {
 		calls.Add(1)
 		select {
 		case targets <- address:
@@ -228,8 +229,8 @@ func TestConnectHandler_TargetIdentityBindsScannerReceiptAndDial(t *testing.T) {
 			}
 
 			r := findConnectIntentReceipt(t, rph.findReceipts(t))
-			if r.ActionRecord.Target != tc.wantScannerURL {
-				t.Fatalf("receipt target = %q, want %q", r.ActionRecord.Target, tc.wantScannerURL)
+			if wantReceiptTarget := strings.TrimSuffix(tc.wantScannerURL, "/"); r.ActionRecord.Target != wantReceiptTarget {
+				t.Fatalf("receipt target = %q, want %q", r.ActionRecord.Target, wantReceiptTarget)
 			}
 		})
 	}

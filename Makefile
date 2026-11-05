@@ -17,7 +17,7 @@ LDFLAGS := -ldflags "-s -w \
 	-X $(MODULE)/internal/rules.KeyringHex=$(RULES_KEYRING_HEX) \
 	-X $(MODULE)/internal/release.PublicKeyringHex=$(RELEASE_KEYRING_HEX)"
 
-.PHONY: all build build-verifier verify-examples test test-wasm-verifier bench bench-baseline bench-regression bench-egress bench-egress-long bench-egress-release lint test-stability-check clean docker install fmt vet tidy-check fuzz stats docs-check brand-assets brand-check source-header-check reproducible-build-check \
+.PHONY: all build build-verifier verify-examples test test-wasm-verifier bench bench-smoke bench-baseline bench-regression bench-egress bench-egress-long bench-egress-release lint test-stability-check clean docker install fmt vet tidy-check fuzz stats docs-check brand-assets brand-check source-header-check reproducible-build-check \
 	test-runtime-critical test-replay-harness test-sharded test-sharded-enterprise release-audit runtime-policy-audit debt-check release-check hermes-e2e test-liveproof
 
 all: build
@@ -59,7 +59,7 @@ test-runtime-critical:
 # to run the full suite in scoped chunks instead of the single monolithic
 # `go test ./...` invocation that becomes a long pole if reused in one CI step.
 # `make test` stays the canonical full local run.
-TEST_SHARDS := proxy-0 proxy-1 proxy-2 proxy-3 proxy-4 proxy-5 proxy-6 scanner-0 scanner-1 scanner-2 scanner-3 mcp-0 mcp-1 mcp-2 mcp-3 mcp-4 mcp-5 mcp-6 mcp-7 runtime-0 runtime-1 rest-0 rest-1 rest-2 rest-3
+TEST_SHARDS := proxy-0 proxy-1 proxy-2 proxy-3 proxy-4 proxy-5 proxy-6 proxy-7 scanner-0 scanner-1 scanner-2 scanner-3 mcp-0 mcp-1 mcp-2 mcp-3 mcp-4 mcp-5 mcp-6 mcp-7 runtime-0 runtime-1 rest-0 rest-1 rest-2 rest-3
 .PHONY: FORCE
 FORCE:
 
@@ -121,6 +121,9 @@ test-liveproof:
 
 bench:
 	go test -bench=. -benchmem -count=3 -run=^$$ ./internal/scanner/ ./internal/mcp/
+
+bench-smoke:
+	python3 scripts/bench_run.py --smoke
 
 bench-baseline:
 	bash scripts/check-bench-regression.sh --update-baseline

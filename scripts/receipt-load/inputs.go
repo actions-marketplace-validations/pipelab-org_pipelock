@@ -28,7 +28,7 @@ import (
 // harnessContractVersion is bumped by hand whenever the measurement contract
 // (what is measured, how it is timed, what integrity means) changes. The
 // source hash below changes on any edit; this number names the contract.
-const harnessContractVersion = "5"
+const harnessContractVersion = "7"
 
 //go:embed *.go
 var harnessSource embed.FS
@@ -363,9 +363,10 @@ func sha256File(path string) (string, error) {
 
 // configParams are the settings the harness forces on the generated config.
 type configParams struct {
-	mode   string
-	chains int
-	dirs   runDirs
+	mode         string
+	chains       int
+	dirs         runDirs
+	destinations *destinationPlan
 }
 
 // configReport is the effective config the child ran with. SHA256 hashes the
@@ -402,6 +403,14 @@ func applyConfig(base []byte, p configParams) ([]byte, error) {
 		return nil, err
 	}
 	ssrf["ip_allowlist"] = []string{"127.0.0.1/32"}
+	if p.destinations != nil {
+		dns, dnsErr := configSection(cfg, "dns")
+		if dnsErr != nil {
+			dns = map[string]any{}
+			cfg["dns"] = dns
+		}
+		dns["host_overrides"] = p.destinations.overrides()
+	}
 	fr, err := configSection(cfg, "flight_recorder")
 	if err != nil {
 		return nil, err
@@ -409,6 +418,16 @@ func applyConfig(base []byte, p configParams) ([]byte, error) {
 	fr["enabled"] = p.mode != modeOff
 	fr["require_receipts"] = p.mode == modeRequired
 	fr["receipt_chains"] = p.chains
+	// Enterprise builds write a dashboard runtime snapshot, by default under
+	// the recorder directory, whenever that directory is set, including in off
+	// mode. It is not receipt evidence, so keep it running but outside the
+	// recorder directory the integrity check inventories.
+	snapshot, err := configSection(cfg, "dashboard_snapshot")
+	if err != nil {
+		snapshot = map[string]any{}
+		cfg["dashboard_snapshot"] = snapshot
+	}
+	snapshot["path"] = filepath.Join(p.dirs.root, "dashboard-runtime-snapshot.json")
 	rules, err := configSection(cfg, "rules")
 	if err != nil {
 		rules = map[string]any{}
