@@ -140,6 +140,11 @@ const (
 	// recorder into CheckRedirect so policy is re-evaluated against the same
 	// identity and state on every hop.
 	ctxKeyRedirectSessionRecorder
+	// ctxKeyRedirectStructuralExemption carries a *atomic.Bool that
+	// CheckRedirect sets when an allowed hop was a structural exemption (a
+	// valid presigned or GitHub-issued SAS URL). The request's deferred clean
+	// credit then skips it, as it does for a direct exemption.
+	ctxKeyRedirectStructuralExemption
 	// ctxKeyRedirectAirlockSession carries the adaptive session key into
 	// CheckRedirect so every hop admits airlock against the same state the
 	// writer raised. Request-controlled identities use the folded CEE-safe key;
@@ -1142,6 +1147,11 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 					return newRedirectBlockedRequest(result.Scanner, result.Reason)
 				}
 				logger.LogAnomaly(actx, result.Scanner, fmt.Sprintf("redirect from %s: %s", originalURL, result.Reason), result.Score)
+			}
+			if result.Allowed && result.IsStructuralExemption() {
+				if hop, ok := req.Context().Value(ctxKeyRedirectStructuralExemption).(*atomic.Bool); ok {
+					hop.Store(true)
+				}
 			}
 			scannerMatched := !result.Allowed
 			// net/http copies custom headers to redirected requests. Recheck
@@ -3018,14 +3028,20 @@ func (p *Proxy) SetLicenseRevoked(cfg *config.Config, revoked bool) bool {
 }
 
 // ShutdownAgentServers gracefully shuts down all registered agent servers.
+// It returns ErrShutdownIncomplete and the cause if any listener fails to drain.
 // Used by the license expiry watchdog to unbind per-agent listeners when
 // the enterprise license expires at runtime.
-func (p *Proxy) ShutdownAgentServers() {
+func (p *Proxy) ShutdownAgentServers() error {
+	var shutdownErr error
 	for _, srv := range p.agentServers {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = srv.Shutdown(ctx)
+		shutdownErr = errors.Join(shutdownErr, srv.Shutdown(ctx))
 		cancel()
 	}
+	if shutdownErr != nil {
+		return errors.Join(ErrShutdownIncomplete, shutdownErr)
+	}
+	return nil
 }
 
 // buildCEE creates entropy tracker and fragment buffer based on the config.
@@ -5254,6 +5270,10 @@ func (p *Proxy) Handler() http.Handler {
 	return p.buildHandler(p.buildMux())
 }
 
+// ErrShutdownIncomplete means a listener failed to drain before shutdown ended.
+// Callers must not seal receipt chains as complete after this error.
+var ErrShutdownIncomplete = errors.New("proxy shutdown incomplete")
+
 // Start starts the fetch proxy HTTP server. It blocks until the context
 // is cancelled or the server encounters a fatal error.
 func (p *Proxy) Start(ctx context.Context) error {
@@ -5317,39 +5337,65 @@ func (p *Proxy) start(ctx context.Context, ln net.Listener) error {
 	// pre-binds ports for fail-fast error reporting. proxy.Start()
 	// only manages the main server lifecycle.
 
-	// Graceful shutdown on context cancellation.
-	// The done channel ensures this goroutine exits if ListenAndServe
-	// fails immediately (e.g., address already in use).
-	done := make(chan struct{})
-	go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
-		select {
-		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			for _, srv := range p.agentServers {
-				if shutErr := srv.Shutdown(shutdownCtx); shutErr != nil {
-					p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", srv.Addr), shutErr)
-				}
-			}
-			if err := p.server.Shutdown(shutdownCtx); err != nil {
-				p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", listenAddr), err)
-			}
-			p.Close()
-		case <-done:
-		}
-	}()
-
 	p.logger.LogStartup(listenAddr, cfg.Mode, Version, cfg.Hash())
 
-	var err error
-	if ln != nil {
-		err = p.server.Serve(ln)
-	} else {
-		err = p.server.ListenAndServe()
-	}
-	close(done) // unblock shutdown goroutine if server failed immediately
-	if errors.Is(err, http.ErrServerClosed) {
+	err := serveUntilShutdown(ctx, func() error {
+		if ln != nil {
+			return p.server.Serve(ln)
+		}
+		return p.server.ListenAndServe()
+	}, func() error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var shutdownErr error
+		for _, srv := range p.agentServers {
+			if shutErr := srv.Shutdown(shutdownCtx); shutErr != nil {
+				p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", srv.Addr), shutErr)
+				shutdownErr = errors.Join(shutdownErr, shutErr)
+			}
+		}
+		if err := p.server.Shutdown(shutdownCtx); err != nil {
+			p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", listenAddr), err)
+			shutdownErr = errors.Join(shutdownErr, err)
+		}
+		p.Close()
+		return shutdownErr
+	})
+	if errors.Is(err, http.ErrServerClosed) && !errors.Is(err, ErrShutdownIncomplete) {
 		return nil
+	}
+	return err
+}
+
+// serveUntilShutdown runs serve and calls shutdown once ctx is cancelled or
+// serve returns. It returns serve's error only after shutdown has finished.
+// Shutdown failures also return ErrShutdownIncomplete and their cause, so
+// an expired grace period cannot be mistaken for a completed drain.
+//
+// Serve returns ErrServerClosed as soon as Shutdown begins, before in-flight
+// handlers finish, so returning on serve alone would report the server stopped
+// while handlers still run. The runtime seals the transcript root and closes the
+// receipt recorder once start returns, and an early return loses the outcome
+// receipt of every request still being served. A listener error also stops
+// Serve without draining handlers, so the done channel triggers the same drain
+// when serve returns without ctx being cancelled.
+func serveUntilShutdown(ctx context.Context, serve func() error, shutdown func() error) error {
+	done := make(chan struct{})
+	shutdownDone := make(chan struct{})
+	var shutdownErr error
+	go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
+		defer close(shutdownDone)
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
+		shutdownErr = shutdown()
+	}()
+	err := serve()
+	close(done)
+	<-shutdownDone
+	if shutdownErr != nil {
+		return errors.Join(err, ErrShutdownIncomplete, shutdownErr)
 	}
 	return err
 }
@@ -6303,6 +6349,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
+	redirectExempt := new(atomic.Bool)
+	ctx = context.WithValue(ctx, ctxKeyRedirectStructuralExemption, redirectExempt)
 	ctx = context.WithValue(ctx, ctxKeyReceiptShard, selectedReceiptShard)
 	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
 	if fetchAirlockSess != nil {
@@ -6957,7 +7005,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Deferred RecordClean: apply score decay only when no finding was detected
 	// during the entire fetch lifecycle (URL, header DLP, CEE, response scan).
 	// This ensures warn/near-miss findings do not inadvertently decay score.
-	if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding {
+	// A structural exemption (a valid presigned or GitHub-issued SAS URL) is
+	// adaptive-neutral: it neither raises the score nor earns clean credit.
+	if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !result.IsStructuralExemption() && !redirectExempt.Load() {
 		fetchScope := adaptiveScopeForHost(finalHost)
 		recordCleanForAdaptiveScope(fetchRec, fetchScope, &cfg.AdaptiveEnforcement, sc.ResponseScanningEnabled() && !responseScanExempt, adaptiveRecoveryContext{
 			assessment: scanned.result.RecoveryAssessment(),
