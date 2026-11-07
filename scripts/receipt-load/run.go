@@ -46,6 +46,7 @@ type options struct {
 	chains          int
 	seed            uint64
 	window          time.Duration
+	readyTimeout    time.Duration
 	shutdownTimeout time.Duration
 	verifyTimeout   time.Duration
 	restartAfter    int
@@ -75,6 +76,7 @@ func runMode(ctx context.Context, opt options, mode string) (*result, error) {
 		Performance: performanceReport{Verdict: perfInvalid, Reasons: []string{"measurement did not complete"}},
 		Integrity:   integrityReport{Verdict: verdictFail, Reasons: []string{"integrity was not evaluated"}},
 	}
+	res.Inputs.ReadyTimeoutSeconds = opt.readyTimeout.Seconds()
 	res.Inputs.Workload = workloadReport{
 		Seed: plan.seed, Tag: plan.tag(), KeyParam: workloadKeyParam,
 		Destinations: destinationMode(opt.destinations), BlockEvery: blockEvery, BlockOffset: plan.blockOffset, WindowSeconds: opt.window.Seconds(),
@@ -166,7 +168,7 @@ func execute(ctx context.Context, opt options, mode string, dirs runDirs, plan w
 		return err
 	}
 	defer func() { proxy.cleanup() }()
-	if err := awaitProxy(ctx, proxyAddr, proxy); err != nil {
+	if err := awaitProxy(ctx, proxyAddr, proxy, opt.readyTimeout); err != nil {
 		return err
 	}
 	logf("%s: proxy ready; warmup %d then %d requests at concurrency %d", mode, opt.warmup, opt.requests, opt.concurrency)
@@ -245,7 +247,7 @@ func execute(ctx context.Context, opt options, mode string, dirs runDirs, plan w
 			return fmt.Errorf("restart proxy: %w", err)
 		}
 		proxy = next
-		if err := awaitProxy(ctx, proxyAddr, proxy); err != nil {
+		if err := awaitProxy(ctx, proxyAddr, proxy, opt.readyTimeout); err != nil {
 			return fmt.Errorf("restart readiness: %w", err)
 		}
 		samples.close()
@@ -303,13 +305,17 @@ func execute(ctx context.Context, opt options, mode string, dirs runDirs, plan w
 
 	integrity := finishIntegrity(context.WithoutCancel(ctx), opt, mode, dirs, childEnv, plan, sink, warm, measured, end, shutdown, &perf)
 
-	if lines, logErr := bundleLogLines(filepath.Join(dirs.root, "proxy.log")); logErr != nil {
+	// A decode error still returns the bundle lines found around it; keep them
+	// so a malformed record cannot hide the activity it sits next to.
+	lines, logErr := bundleLogLines(filepath.Join(dirs.root, "proxy.log"))
+	if logErr != nil {
 		integrity.fail("reading proxy.log failed: " + logErr.Error())
-	} else {
+	}
+	if lines != nil {
 		res.Inputs.Rules.ProxyLogLines = lines
-		if res.Inputs.Rules.Mode == rulesEmpty && len(lines) > 0 {
-			integrity.fail("proxy reported rule bundle activity under --rules empty: " + lines[0])
-		}
+	}
+	if res.Inputs.Rules.Mode == rulesEmpty && len(lines) > 0 {
+		integrity.fail("proxy reported rule bundle activity under --rules empty: " + lines[0])
 	}
 	failOnAuditGaps(&integrity, dirs, false)
 	if ctx.Err() != nil {
@@ -686,6 +692,9 @@ func failOnAuditGaps(integrity *integrityReport, dirs runDirs, failedRun bool) {
 	count, lines, err := auditGapLines(filepath.Join(dirs.root, "proxy.log"))
 	if count > 0 {
 		integrity.fail(fmt.Sprintf("proxy reported %d audit gap(s); first: %s", count, lines[0]))
+		for _, line := range lines[1:] {
+			integrity.fail("proxy audit gap sample: " + line)
+		}
 	}
 	if err != nil && (!failedRun || !errors.Is(err, fs.ErrNotExist)) {
 		integrity.fail("reading proxy.log failed: " + err.Error())

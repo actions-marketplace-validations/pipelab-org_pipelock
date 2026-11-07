@@ -262,14 +262,163 @@ func (pc *Config) CheckToolCall(toolName string, argStrings []string) Verdict {
 //  3. Pairwise token combinations - catches map-ordering evasion where
 //     command and flags land in separate values with non-deterministic order
 func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, rawArgs json.RawMessage) Verdict {
-	return pc.checkToolCallWithArgs(toolName, argStrings, rawArgs, true, argStrings, rawArgs)
+	return pc.checkToolCallWithArgs(toolName, argStrings, rawArgs, toolCallOptions{checkInput: true, proofArgs: argStrings, proofShape: rawArgs})
+}
+
+// File target/destination names follow the shipped rule contracts; source and
+// paths are the move/copy and multi-file reader carriers exercised by policy.
+// location, relative_path and output follow TestPolicy_FileArgumentPathScope's
+// alternate pathname contract, including filenames containing whitespace.
+var filePathArgumentKey = regexp.MustCompile(fileTargetKeyPattern + "|" + fileDestinationKeyPattern + `|(?i)^(source|source_?path|paths|location|relative_path|output)$`)
+
+// pathnameValues returns the string values under pathname keys. A scoped rule
+// uses its operator-supplied arg_key to select top-level pathname candidates,
+// as ExtractStringsForKeys does, including custom keys. An unscoped rule reads
+// a built-in pathname key at any depth, since a tool may
+// nest its operands (an operation object, a list of operations). Every string
+// under a pathname key is a value of that key; strings under other keys do not
+// receive its whitespace-preserving pathname reading. Nesting past the shared
+// extraction bound under a pathname key is reported rather than skipped, so the caller
+// fails closed as it does for a scoped rule. ok is false when raw is not a JSON
+// object, so no key tells path from content.
+func pathnameValues(raw json.RawMessage, scope *regexp.Regexp) (paths []string, truncated, ok bool) {
+	var parsed any
+	if extract.DecodeJSON(raw, &parsed) != nil {
+		return nil, false, false
+	}
+	top, isObject := parsed.(map[string]any)
+	if !isObject {
+		return nil, false, false
+	}
+	var leaves func(v any, depth int)
+	leaves = func(v any, depth int) {
+		if depth > extract.MaxExtractDepth {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			paths = append(paths, val)
+		case []any:
+			for _, item := range val {
+				leaves(item, depth+1)
+			}
+		case map[string]any:
+			for _, key := range jsonrpc.SortedKeys(val) {
+				leaves(val[key], depth+1)
+			}
+		}
+	}
+	var walk func(v any, depth int)
+	walk = func(v any, depth int) {
+		if depth > extract.MaxExtractDepth {
+			// Nothing below the bound is extracted as a value either; callers
+			// that extract the values already treat that as uninspectable.
+			return
+		}
+		switch val := v.(type) {
+		case []any:
+			for _, item := range val {
+				walk(item, depth+1)
+			}
+		case map[string]any:
+			for _, key := range jsonrpc.SortedKeys(val) {
+				if filePathArgumentKey.MatchString(key) {
+					leaves(val[key], depth+1)
+					continue
+				}
+				walk(val[key], depth+1)
+			}
+		}
+	}
+	if scope == nil {
+		walk(top, 0)
+		return paths, truncated, true
+	}
+	for _, key := range jsonrpc.SortedKeys(top) {
+		if scope.MatchString(key) {
+			leaves(top[key], 0)
+		}
+	}
+	return paths, truncated, true
+}
+
+// expandToolPaths retains the baseline local identity check for every submitted
+// value, as written, and adds whitespace-preserving spellings only for explicit
+// pathname fields. A name with a space under an unrecognized key is still
+// followed, so a link to a protected file cannot hide behind one. A scoped
+// rule cannot acquire paths from other keys. All values share one local identity
+// pass so hard-link inspection does not repeat for each reading.
+// Arguments with no JSON key to tell path from content keep every value as a
+// candidate path, as a call without raw arguments does.
+func (pc *Config) expandToolPaths(values []string, raw json.RawMessage, fileTool bool, scope *regexp.Regexp) ([]string, []string, bool) {
+	if !fileTool {
+		expanded, notes := pc.localPaths.expandNoted(values, false)
+		return expanded, notes, false
+	}
+	paths := values
+	if len(raw) != 0 {
+		keyed, truncated, ok := pathnameValues(raw, scope)
+		if truncated {
+			return nil, nil, true
+		}
+		if ok {
+			paths = keyed
+		}
+	}
+	// The identity resolver refuses NUL, line breaks, hierarchical URLs and
+	// oversized values. Single-line content that also names a local path remains
+	// a candidate; excluding it would let an unrecognized pathname key bypass
+	// the baseline identity check.
+	expanded, notes := pc.localPaths.expandNoted(identityCandidates(paths, values), false)
+	seen := make(map[string]bool)
+	out := slices.Clone(values)
+	for _, value := range values {
+		seen[value] = true
+	}
+	for _, value := range expanded {
+		if !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out, notes, false
+}
+
+// identityCandidates is the local identity lookup list: pathname-field values
+// with their spellings, then every submitted value as written. Each distinct
+// candidate appears once, so a value repeated many times in one call costs one
+// filesystem lookup. Rule matching still sees every submitted value.
+func identityCandidates(pathnames, values []string) []string {
+	return uniqueStrings(append(withPathSpellings(pathnames, true), values...))
+}
+
+// uniqueStrings returns values without repeats, keeping first-seen order.
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // checkToolCallWithArgs checks argStrings. proofArgs and proofShape are the
 // submitted values and the JSON that carried them, read for the Git builtin
 // exception (see proveGitBuiltins); a shape is used only where it reproduces
 // proofArgs.
-func (pc *Config) checkToolCallWithArgs(toolName string, argStrings []string, rawArgs json.RawMessage, checkInput bool, proofArgs []string, proofShape json.RawMessage) Verdict {
+type toolCallOptions struct {
+	checkInput bool
+	proofArgs  []string
+	proofShape json.RawMessage
+	shell      *shellRuleProof
+}
+
+func (pc *Config) checkToolCallWithArgs(toolName string, argStrings []string, rawArgs json.RawMessage, opts toolCallOptions) Verdict {
+	checkInput, proofArgs, proofShape := opts.checkInput, opts.proofArgs, opts.proofShape
 	if pc == nil || len(pc.Rules) == 0 {
 		return Verdict{}
 	}
@@ -320,8 +469,12 @@ func (pc *Config) checkToolCallWithArgs(toolName string, argStrings []string, ra
 	// The proof reads the submitted values, before local path identities are
 	// added to the values matched.
 	proof := proveGitBuiltins(proofArgs, jsonArgCarriers(proofShape, proofArgs), gitTool)
-	matchArgs, linkNotes := pc.localPaths.expandNoted(argStrings)
-	views := buildArgViews(matchArgs, gitTool, &proof)
+	pathValues := pathValueToolName.MatchString(policyToolName) || pathValueToolName.MatchString(baselineToolName)
+	matchArgs, linkNotes, truncatedPaths := pc.expandToolPaths(argStrings, proofShape, pathValues, nil)
+	if truncatedPaths {
+		return uninspectableJSONDepthVerdict()
+	}
+	views := buildArgViews(matchArgs, gitTool, &proof, !pathValues)
 	if !checkInput {
 		for i := range views {
 			views[i].checkXargs = false
@@ -366,38 +519,45 @@ func (pc *Config) checkToolCallWithArgs(toolName string, argStrings []string, ra
 			if scoped.Truncated {
 				return uninspectableJSONDepthVerdict()
 			}
-			scopedStrings, scopedNotes := pc.localPaths.expandNoted(scoped.Strings)
+			scopedStrings, scopedNotes, truncated := pc.expandToolPaths(scoped.Strings, proofShape, pathValues, rule.ArgKey)
+			if truncated {
+				return uninspectableJSONDepthVerdict()
+			}
 			patchFallbackArgs = scopedStrings
 			credentialDestinations = scopedStrings
 			linkNotes = appendUniqueNotes(linkNotes, scopedNotes)
-			ruleViews = buildArgViews(scopedStrings, gitTool, nil)
+			ruleViews = buildArgViews(scopedStrings, gitTool, nil, !pathValues)
 		}
 		if rule.ArgSource == config.ToolPolicyArgSourcePatchTargets {
 			patchTargets, inspection := extractPatchTargetPaths(argStrings)
 			patchInspection = inspection
 			if inspection != patchTargetsOrdinary {
-				expandedTargets, patchNotes := pc.localPaths.expandNoted(withPatchPrefixStripped(patchTargets))
+				expandedTargets, patchNotes := pc.localPaths.expandNoted(withPatchPrefixStripped(patchTargets), true)
 				linkNotes = appendUniqueNotes(linkNotes, patchNotes)
 				matchStrings := patchTargetMatchStrings(patchFallbackArgs, expandedTargets)
 				credentialDestinations = matchStrings
-				ruleViews = buildArgViews(matchStrings, gitTool, nil)
+				ruleViews = buildArgViews(matchStrings, gitTool, nil, false)
 			}
 		}
 
 		argPatternMatched := patchInspection == patchTargetsUninspectable || rule.ArgPattern == nil
 		pairIncomplete := false
 		if !argPatternMatched {
-			argPatternMatched, pairIncomplete = matchArgViews(rule.ArgPattern, ruleViews[:]...)
+			if replacement, ok := opts.shell.views(rule); ok {
+				argPatternMatched, pairIncomplete = matchArgViews(rule.ArgPattern, replacement...)
+			} else {
+				argPatternMatched, pairIncomplete = matchArgViews(rule.ArgPattern, ruleViews[:]...)
+			}
 		}
 		// The shipped credential exception describes one submitted value. JSON
 		// keys and local aliases are not additional arguments to that value.
 		// Keep the shared pairwise matcher unchanged for every other rule and
 		// for calls with more than one string value.
-		if matched, incomplete, handled := pc.matchSingleCredentialArgument(rule, argStrings, rawArgs, credentialViews); handled {
+		if matched, incomplete, handled := pc.matchSingleCredentialArgument(rule, argStrings, rawArgs, credentialViews, pathValues); handled {
 			argPatternMatched, pairIncomplete = matched, incomplete
 		}
 		if patchInspection != patchTargetsUninspectable {
-			if matched, incomplete, handled := pc.matchCredentialDestinations(rule, credentialDestinations, credentialViews); handled {
+			if matched, incomplete, handled := pc.matchCredentialDestinations(rule, credentialDestinations, credentialViews, !pathValues); handled {
 				argPatternMatched, pairIncomplete = matched, incomplete
 			}
 		}
@@ -1259,7 +1419,7 @@ func (pc *Config) checkSingle(line []byte) Verdict {
 
 	// The arguments' JSON shape is kept for the Git builtin exception even when
 	// no rule reads raw arguments.
-	return pc.checkToolCallWithArgs(tc.Name, argStrings, rawArgs, true, argStrings, tc.Arguments)
+	return pc.checkToolCallWithArgs(tc.Name, argStrings, rawArgs, toolCallOptions{checkInput: true, proofArgs: argStrings, proofShape: tc.Arguments})
 }
 
 // ArgValues returns the string values of JSON arguments, in sorted-key
@@ -1287,7 +1447,7 @@ func (pc *Config) CheckToolCallJSON(toolName string, values, withKeys []string, 
 	// turn a proved command string into an unknown argument array.
 	// The key pass reads no git tool argument list, so its Git commands are
 	// proved from the values read the same way.
-	return mergeVerdicts(v, pc.checkToolCallWithArgs(toolName, withKeys, rawArgs, false, values, rawArgs))
+	return mergeVerdicts(v, pc.checkToolCallWithArgs(toolName, withKeys, rawArgs, toolCallOptions{proofArgs: values, proofShape: rawArgs}))
 }
 
 // mergeVerdicts combines two verdicts for one call. The stricter action wins
@@ -1622,6 +1782,17 @@ func expandBraces(s string) string {
 	})
 }
 
+// shellCommandStart follows bash(1), DEFINITIONS (metacharacters), Quoting and
+// Word Splitting: blanks and ;|&()<> start words; backticks/$() and quotes can
+// introduce commands, and / admits path-qualified executables. Keep = as a
+// conservative assignment-value boundary: x=nc can later execute through $x.
+// Neither : nor a word character separates a shell word. This is a text policy,
+// not proof that every matched word is executed.
+// The broader regex whitespace class also matches CR and FF, which bash does
+// not treat as word boundaries. Retain those conservative blocking matches;
+// shellProofWords refuses unsupported controls before granting any exception.
+const shellCommandStart = `(?:^|[\s;|&()<>\x60\x22\x27/=])`
+
 // DefaultToolPolicyRules returns the built-in set of tool call policy rules
 // covering common dangerous operations that agents might attempt.
 const (
@@ -1737,7 +1908,7 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 		{
 			Name:        "Reverse Shell",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
-			ArgPattern:  `(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e|\b(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+-[a-z0-9]*e\b|\b(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+((?-i:-[a-z0-9]*c)\b|--(?:sh-|lua-)?exec\b)|\bbash(?:\s+-[a-z]+)*?\s+-[a-z]*i[a-z]*(?:\s+-[a-z]+)*?\s+>&|/dev/udp/)`,
+			ArgPattern:  `(?i)((?:^|[\s;|&()<>\x60\x22\x27/=])bash\s+-i\s+>&|/dev/tcp/|(?:^|[\s;|&()<>\x60\x22\x27/=])mkfifo\s+|(?:^|[\s;|&()<>\x60\x22\x27/=])nc\s+-e|(?:^|[\s;|&()<>\x60\x22\x27/=])ncat\s+-e|(?:^|[\s;|&()<>\x60\x22\x27/=])(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+-[a-z0-9]*e\b|(?:^|[\s;|&()<>\x60\x22\x27/=])(?:nc|ncat|netcat)(?:\s+[^\s;|&]+)*?\s+((?-i:-[a-z0-9]*c)\b|--(?:sh-|lua-)?exec\b)|(?:^|[\s;|&()<>\x60\x22\x27/=])bash(?:\s+-[a-z]+)*?\s+-[a-z]*i[a-z]*(?:\s+-[a-z]+)*?\s+>&|/dev/udp/)`,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1775,7 +1946,7 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 		{
 			Name:        "Destructive Git Operation",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|git)$`,
-			ArgPattern:  `(?i)(\bgit\s+)?(push(?:\s+[^\s;|&]+)*?\s+(--force(?:[\s;&|()<>]|$)|-[a-z]*f[a-z]*\b|\+[^\s;|&]+)|reset(?:\s+[^\s;|&]+)*?\s+--hard\b|clean(?:\s+[^\s;|&]+)*?\s+(-[a-z]*(f[a-z]*d|d[a-z]*f)[a-z]*\b|-[a-z]*f[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*d[a-z]*\b|-[a-z]*d[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*f[a-z]*\b))`,
+			ArgPattern:  `(?i)(?:^|[\s;|&()<>\x60\x22\x27/=])(git\s+)?(push(?:\s+[^\s;|&]+)*?\s+(--force(?:[\s;&|()<>]|$)|-[a-z]*f[a-z]*\b|\+[^\s;|&]+)|reset(?:\s+[^\s;|&]+)*?\s+--hard\b|clean(?:\s+[^\s;|&]+)*?\s+(-[a-z]*(f[a-z]*d|d[a-z]*f)[a-z]*\b|-[a-z]*f[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*d[a-z]*\b|-[a-z]*d[a-z]*(?:\s+[^\s;|&]+)*?\s+-[a-z]*f[a-z]*\b))`,
 			Action:      config.ActionBlock,
 		},
 		{

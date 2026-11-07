@@ -68,8 +68,20 @@ func TestDecodingPreprocessingParity(t *testing.T) {
 			if len(want) > 0 {
 				decodedCases++
 			}
-			if got := decodeEncodings(input); !reflect.DeepEqual(got, want) {
-				t.Fatalf("ordered decoding differs for %q:\ngot %#v\nwant %#v", input, got, want)
+			// Numeric and quoted-printable views have separate behavioral
+			// tests. This reference freezes the other decoders' ordering and
+			// duplicates, including inputs that also form a textual carrier.
+			var legacy []decodedResult
+			for _, view := range decodeEncodings(input) {
+				switch view.encoding {
+				case encodingDecimal, encodingOctal, encodingBinary, encodingQuotedPrintable:
+					continue
+				default:
+					legacy = append(legacy, view)
+				}
+			}
+			if !reflect.DeepEqual(legacy, want) {
+				t.Fatalf("ordered decoding differs for %q:\ngot %#v\nwant %#v", input, legacy, want)
 			}
 		})
 	}
@@ -152,10 +164,13 @@ func referenceDecodeEncodingsFixpoint(s string, includeURL bool) []decodedResult
 	consumed := 0
 	for head := 0; head < len(queue) && len(out) < maxDecodeCandidates && consumed < maxDecodeTotalBytes; head++ {
 		text := queue[head]
-		candidates := referenceDecodeEncodings(text)
+		// Carrier parser behavior has separate cases. This reference checks
+		// traversal and byte accounting with their views included.
+		candidates := appendTextEncodingViews(nil, text)
+		candidates = append(candidates, referenceDecodeEncodings(text)...)
 		if includeURL {
 			if decoded := IterativeDecode(text); decoded != text && decoded != "" {
-				candidates = append(candidates, decodedResult{decoded, encodingURL})
+				candidates = append(candidates, decodedResult{text: decoded, encoding: encodingURL})
 			}
 		}
 		for _, decoded := range candidates {
@@ -266,11 +281,11 @@ func referenceNormalizeEncodedToken(s string, kind encodedTokenKind) string {
 func referenceDecodeEncodings(s string) []decodedResult {
 	var out []decodedResult
 	if decoded, err := hex.DecodeString(s); err == nil && len(decoded) > 0 {
-		out = append(out, decodedResult{string(decoded), encodingHex})
+		out = append(out, decodedResult{text: string(decoded), encoding: encodingHex})
 	} else if normalized := referenceNormalizeHex(s); normalized != "" {
 		// Delimiter-separated hex (e.g., 73:6b:2d, \x73\x6b, 0x736b).
 		if decoded, err := hex.DecodeString(normalized); err == nil && len(decoded) > 0 {
-			out = append(out, decodedResult{string(decoded), encodingHex})
+			out = append(out, decodedResult{text: string(decoded), encoding: encodingHex})
 		}
 	}
 	for _, enc := range []*base64.Encoding{
@@ -278,20 +293,32 @@ func referenceDecodeEncodings(s string) []decodedResult {
 		base64.RawStdEncoding, base64.RawURLEncoding,
 	} {
 		if decoded, err := enc.DecodeString(s); err == nil && len(decoded) > 0 {
-			out = append(out, decodedResult{string(decoded), encodingBase64})
+			out = append(out, decodedResult{text: string(decoded), encoding: encodingBase64})
 		}
 	}
 	if normalized := referenceNormalizeEncodedToken(s, encodedTokenBase64Std); normalized != "" {
 		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
 			if decoded, err := enc.DecodeString(normalized); err == nil && len(decoded) > 0 {
-				out = append(out, decodedResult{string(decoded), encodingBase64})
+				out = append(out, decodedResult{text: string(decoded), encoding: encodingBase64})
 			}
 		}
 	}
 	if normalized := referenceNormalizeEncodedToken(s, encodedTokenBase64URL); normalized != "" {
 		for _, enc := range []*base64.Encoding{base64.URLEncoding, base64.RawURLEncoding} {
 			if decoded, err := enc.DecodeString(normalized); err == nil && len(decoded) > 0 {
-				out = append(out, decodedResult{string(decoded), encodingBase64})
+				out = append(out, decodedResult{text: string(decoded), encoding: encodingBase64})
+			}
+		}
+	}
+	// RFC 4648 sections 4 and 5 share symbol values. Keep mixed-family
+	// raw and separator-normalized views in addition to the original views.
+	if strings.ContainsAny(s, "+/") && strings.ContainsAny(s, "-_") {
+		mixed := strings.NewReplacer("-", "+", "_", "/").Replace(s)
+		for _, value := range []string{mixed, referenceNormalizeEncodedToken(mixed, encodedTokenBase64Std)} {
+			for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
+				if decoded, err := enc.DecodeString(value); err == nil && len(decoded) > 0 {
+					out = append(out, decodedResult{text: string(decoded), encoding: encodingBase64})
+				}
 			}
 		}
 	}
@@ -305,7 +332,7 @@ func referenceDecodeEncodings(s string) []decodedResult {
 		out = referenceAppendBase32Decodes(out, normalized)
 	}
 	if decoded := normalize.DecodeJSONUnicodeEscapes(s); decoded != s && decoded != "" {
-		out = append(out, decodedResult{decoded, encodingJSONUnicode})
+		out = append(out, decodedResult{text: decoded, encoding: encodingJSONUnicode})
 	}
 	return out
 }
@@ -321,7 +348,7 @@ func referenceAppendBase32Decodes(out []decodedResult, value string) []decodedRe
 		if err != nil || len(decoded) == 0 {
 			continue
 		}
-		out = append(out, decodedResult{string(decoded), encodingBase32})
+		out = append(out, decodedResult{text: string(decoded), encoding: encodingBase32})
 	}
 	return out
 }

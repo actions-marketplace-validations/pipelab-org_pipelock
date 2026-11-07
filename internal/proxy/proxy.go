@@ -47,6 +47,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/health"
 	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/httpstream"
 	"github.com/luckyPipewrench/pipelock/internal/identitykey"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
@@ -648,7 +649,8 @@ type Proxy struct {
 	client               *http.Client
 	tlsTransport         *http.Transport // shared Transport for TLS interception upstream connections
 	server               *http.Server
-	agentServers         []*http.Server // per-agent listeners (managed by CLI)
+	agentServers         []httpstream.GatedServer // per-agent listeners (managed by CLI)
+	shutdownGrace        time.Duration            // test hook: graceful shutdown bound; zero means defaultShutdownGrace
 	startTime            time.Time
 	reloadSerialMu       sync.Mutex   // serializes staging by concurrent Reload calls
 	reloadMu             sync.RWMutex // serializes publication and coherent request-time runtime snapshots
@@ -1907,6 +1909,13 @@ func receiptChannelBrokenError(opts receipt.EmitOpts, err error) error {
 
 const receiptLabelOther = "other"
 
+const (
+	receiptFailureAppendLockTimeout = "append_lock_timeout"
+	receiptFailureContentRejected   = "content_rejected"
+	receiptFailureContentChanged    = "content_changed"
+	receiptFailureScanIncomplete    = "scan_incomplete"
+)
+
 // receiptFailureClass reduces a receipt emission failure to a fixed label.
 // An uncertain write outranks a pre-write refusal: a joined error that holds
 // both reports the write that may have reached the disk. A durability
@@ -1929,6 +1938,16 @@ func receiptFailureClass(err error) string {
 		return "entry_too_large"
 	case errors.Is(err, receipt.ErrChainSealed):
 		return "chain_sealed"
+	// The specific causes come before v2_emit, which wraps any v2 receipt
+	// failure: a v2 lock timeout must still report append_lock_timeout.
+	case errors.Is(err, recorder.ErrAppendLockTimeout):
+		return receiptFailureAppendLockTimeout
+	case errors.Is(err, receiptcontent.ErrRejected):
+		return receiptFailureContentRejected
+	case errors.Is(err, recorder.ErrContentChanged):
+		return receiptFailureContentChanged
+	case errors.Is(err, scanner.ErrTextDLPIncomplete):
+		return receiptFailureScanIncomplete
 	case errors.Is(err, errV2ReceiptEmit):
 		return "v2_emit"
 	default:
@@ -3006,8 +3025,12 @@ func (p *Proxy) LoadCertCache(cfg *config.Config) error {
 // RegisterAgentServer adds an externally-managed agent server to the
 // proxy's shutdown list. Called by the CLI layer after binding agent
 // listeners, so Start()'s shutdown goroutine can gracefully stop them.
+// It wraps the server's handler so shutdown can tell running handlers from
+// connections that never delivered a request; call it before Serve.
 func (p *Proxy) RegisterAgentServer(srv *http.Server) {
-	p.agentServers = append(p.agentServers, srv)
+	gate := &httpstream.Gate{}
+	srv.Handler = gate.Wrap(srv.Handler)
+	p.agentServers = append(p.agentServers, httpstream.GatedServer{Server: srv, Gate: gate})
 }
 
 // SetLicenseRevoked publishes a runtime license check serialized with reload.
@@ -3032,12 +3055,12 @@ func (p *Proxy) SetLicenseRevoked(cfg *config.Config, revoked bool) bool {
 // Used by the license expiry watchdog to unbind per-agent listeners when
 // the enterprise license expires at runtime.
 func (p *Proxy) ShutdownAgentServers() error {
-	var shutdownErr error
-	for _, srv := range p.agentServers {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		shutdownErr = errors.Join(shutdownErr, srv.Shutdown(ctx))
-		cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), p.shutdownGraceOrDefault())
+	defer cancel()
+	for _, gs := range p.agentServers {
+		gs.Gate.StopHijacks()
 	}
+	shutdownErr := errors.Join(httpstream.DrainServers(ctx, p.agentServers)...)
 	if shutdownErr != nil {
 		return errors.Join(ErrShutdownIncomplete, shutdownErr)
 	}
@@ -5272,7 +5295,7 @@ func (p *Proxy) Handler() http.Handler {
 
 // ErrShutdownIncomplete means a listener failed to drain before shutdown ended.
 // Callers must not seal receipt chains as complete after this error.
-var ErrShutdownIncomplete = errors.New("proxy shutdown incomplete")
+var ErrShutdownIncomplete = httpstream.ErrShutdownIncomplete
 
 // Start starts the fetch proxy HTTP server. It blocks until the context
 // is cancelled or the server encounters a fatal error.
@@ -5321,9 +5344,10 @@ func (p *Proxy) start(ctx context.Context, ln net.Listener) error {
 		listenAddr = ln.Addr().String()
 	}
 
+	mainGate := &httpstream.Gate{}
 	p.server = &http.Server{
 		Addr:    listenAddr,
-		Handler: handler,
+		Handler: mainGate.Wrap(handler),
 		BaseContext: func(_ net.Listener) context.Context {
 			return ctx
 		},
@@ -5345,18 +5369,24 @@ func (p *Proxy) start(ctx context.Context, ln net.Listener) error {
 		}
 		return p.server.ListenAndServe()
 	}, func() error {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), p.shutdownGraceOrDefault())
 		defer cancel()
-		var shutdownErr error
-		for _, srv := range p.agentServers {
-			if shutErr := srv.Shutdown(shutdownCtx); shutErr != nil {
-				p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", srv.Addr), shutErr)
-				shutdownErr = errors.Join(shutdownErr, shutErr)
-			}
+		mainGate.StopHijacks()
+		for _, gs := range p.agentServers {
+			gs.Gate.StopHijacks()
 		}
-		if err := p.server.Shutdown(shutdownCtx); err != nil {
-			p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", listenAddr), err)
-			shutdownErr = errors.Join(shutdownErr, err)
+		servers := append(slices.Clone(p.agentServers), httpstream.GatedServer{Server: p.server, Gate: mainGate})
+		var shutdownErr error
+		for i, shutErr := range httpstream.DrainServers(shutdownCtx, servers) {
+			if shutErr == nil {
+				continue
+			}
+			addr := servers[i].Server.Addr
+			if i == len(servers)-1 {
+				addr = listenAddr
+			}
+			p.logger.LogError(audit.NewResourceLogContext("SHUTDOWN", addr), shutErr)
+			shutdownErr = errors.Join(shutdownErr, shutErr)
 		}
 		p.Close()
 		return shutdownErr
@@ -5380,24 +5410,7 @@ func (p *Proxy) start(ctx context.Context, ln net.Listener) error {
 // Serve without draining handlers, so the done channel triggers the same drain
 // when serve returns without ctx being cancelled.
 func serveUntilShutdown(ctx context.Context, serve func() error, shutdown func() error) error {
-	done := make(chan struct{})
-	shutdownDone := make(chan struct{})
-	var shutdownErr error
-	go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
-		defer close(shutdownDone)
-		select {
-		case <-ctx.Done():
-		case <-done:
-		}
-		shutdownErr = shutdown()
-	}()
-	err := serve()
-	close(done)
-	<-shutdownDone
-	if shutdownErr != nil {
-		return errors.Join(err, ErrShutdownIncomplete, shutdownErr)
-	}
-	return err
+	return httpstream.ServeUntilShutdown(ctx, serve, shutdown)
 }
 
 // handleFetch processes URL fetch requests.

@@ -10,9 +10,17 @@ on:
     types: [checks_requested]
     branches: [main]
 
+# A new run cancels an in-progress run on the same ref, main included. Each
+# main push carries the full race suite (about an hour), so main runs queued
+# behind one another; GitHub already cancelled superseded runs that were still
+# pending, and the newest main commit runs the complete suite over all earlier
+# changes. A release candidate whose main run was superseded needs that run
+# rerun before its CI proof. Rerunning an older commit can cancel a newer run
+# on the same ref, so exact-candidate proof needs a quiet main branch.
+# ci-timing-trend.yaml skips cancelled runs.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -118,14 +126,17 @@ jobs:
             < "${diff_file}"
 
   # Merge groups use the same test selection as pull requests on the combined
-  # commit. The classifier compares the queue base/head, including CI policy.
+  # commit. The classifier compares the queue base/head, including Go toolchain changes.
   # The full Go 1.26 race lane remains main-push-only; cache writes stay main-push-only.
   #
   # The Go 1.27 race lane is skipped by default (see the producer jobs
-  # below), but a PR that changes CI policy, Go pins, or the guard that checks
-  # them must still prove both versions before merge -- the whole reason the
-  # 1.27 lane is skipped elsewhere is that it never catches anything OTHER
-  # than a real toolchain change, and this is exactly that case. Uses a
+  # below), but a change to the Go toolchain -- module files, Go pins, setup-go
+  # steps, GOTOOLCHAIN, or the guard that checks them -- must still prove both
+  # versions before merge. The whole reason the 1.27 lane is skipped elsewhere
+  # is that it never catches anything OTHER than a real toolchain change, so
+  # scripts/ci_go_toolchain.py decides exactly that and nothing wider: shard
+  # plans, weights, retry wrappers and coverage settings are checked by the
+  # script unit tests in lint-policy and by the race lane on main. Uses a
   # job-level output (not a workflow-level `paths:` trigger filter) because a
   # `paths:`-filtered workflow run is entirely skipped rather than reporting a
   # check, and a skipped workflow leaves a required check permanently pending
@@ -135,9 +146,17 @@ jobs:
     if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Reading the pull request and its CI runs' artifacts is how a merge group
+    # proves its tree was already tested; nothing here writes.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
-      ci_policy: ${{ steps.check.outputs.ci_policy }}
+      go_toolchain: ${{ steps.check.outputs.go_toolchain }}
       docs_only: ${{ steps.docs.outputs.docs_only }}
+      queue_tree_tested: ${{ steps.reuse.outputs.queue_tree_tested || 'false' }}
+      tested_tree: ${{ steps.tree.outputs.tested_tree }}
       benchmark_smoke: ${{ steps.check.outputs.benchmark_smoke }}
       benchmark_alloc: ${{ steps.check.outputs.benchmark_alloc }}
     steps:
@@ -146,25 +165,26 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Detect CI-policy file changes
+      # The toolchain detector compares parsed setup-go steps, so PyYAML is a
+      # real dependency here, installed hash-pinned as in lint-policy.
+      - name: Install pinned script dependencies
+        run: pip install --require-hashes -r .github/requirements-scripts-test.txt
+
+      - name: Detect Go toolchain changes
         id: check
         env:
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
-          changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
-            .github/workflows/ go.mod go.sum scripts/check-go-matrix.sh \
-            scripts/ci_test_packages.py scripts/ci_test_durations.py \
-            scripts/ci_changed_tests.go scripts/ci_test_durations.json \
-            scripts/ci-test-with-retry.sh scripts/run-race-test.sh Makefile codecov.yml)"
-          if [ -n "$changed" ]; then
-            echo "PR touches CI-policy files:"
-            printf '%s\n' "$changed"
-            echo "ci_policy=true" >> "$GITHUB_OUTPUT"
+          toolchain="$(python3 "${GITHUB_WORKSPACE:-$PWD}/scripts/ci_go_toolchain.py" "${BASE_SHA}" "${HEAD_SHA}")"
+          if [ "$toolchain" = true ]; then
+            echo "Change touches the Go toolchain; the Go 1.27 race matrices run"
+            echo "go_toolchain=true" >> "$GITHUB_OUTPUT"
           else
-            echo "PR touches no CI-policy files"
-            echo "ci_policy=false" >> "$GITHUB_OUTPUT"
+            test "$toolchain" = false
+            echo "Change does not touch the Go toolchain"
+            echo "go_toolchain=false" >> "$GITHUB_OUTPUT"
           fi
 
           # Benchmark compilation is substantial, so limit PR smoke to Go and
@@ -268,6 +288,52 @@ jobs:
           echo "docs_only=$docs_only"
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
+      # Every job in this run checks out github.sha, the pull request's merge
+      # commit, so its tree is exactly what this run tests. build uploads it
+      # once its required gate passes; a merge group reads it below.
+      - name: Record the tree this pull request run tests
+        id: tree
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse --verify "${GITHUB_SHA}^{tree}")"
+          echo "tested_tree=$tree" >> "$GITHUB_OUTPUT"
+
+      # The merge queue builds one candidate at a time. When main has not moved
+      # since the pull request's last green run, the candidate is the identical
+      # tree that run proved, and repeating the suite buys nothing. The checker
+      # answers true only for a verified exact-tree match; any error, mismatch,
+      # or missing evidence answers false and the full suite runs. It runs
+      # main's copy, like the trusted scanner above, so the checker deciding
+      # this run is one main already accepted.
+      - name: Reuse a green pull request result for this exact tree
+        id: reuse
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          QUEUE_SHA: ${{ github.event.merge_group.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          checker="$(mktemp)"
+          if ! git show "${BASE_SHA}:scripts/ci_queue_reuse.py" > "$checker" 2>/dev/null; then
+            echo "main has no queue reuse checker yet; running the full suite"
+            echo "queue_tree_tested=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Share the checker's existing 60-second command budget across the
+          # whole lookup, so several slow API calls cannot exhaust this job's
+          # five-minute deadline before it falls back to the full suite.
+          decision="$(timeout --signal=KILL 60s python3 "$checker" --repo "$REPO" --queue-ref "$QUEUE_REF" --queue-sha "$QUEUE_SHA" --base-sha "$BASE_SHA")" || decision="queue_tree_tested=false"
+          case "$decision" in
+            queue_tree_tested=true|queue_tree_tested=false) ;;
+            *) decision="queue_tree_tested=false" ;;
+          esac
+          echo "$decision"
+          echo "$decision" >> "$GITHUB_OUTPUT"
+
   # Race lane. The race detector multiplies test time by five to eleven, so the
   # full race suite costs about six runner-hours per run. Pull requests get the
   # fast no-race suite below instead; this lane runs on every push to main.
@@ -286,7 +352,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'proxy-8', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'scanner-4', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3', 'rest-4', 'rest-5', 'rest-6', 'rest-7']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -385,7 +451,7 @@ jobs:
   test-unit-go126:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     name: test-${{ matrix.variant }} (1.26, ${{ matrix.shard }})
     timeout-minutes: 15
@@ -394,7 +460,7 @@ jobs:
       matrix:
         variant: ['oss', 'enterprise']
         # Must equal scripts/ci_test_packages.py --list-unit-shards (UNIT_SPLITS).
-        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'scanner', 'mcp-0', 'mcp-1', 'mcp-2', 'runtime', 'rest-0', 'rest-1', 'rest-2']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'scanner-0', 'scanner-1', 'mcp-0', 'mcp-1', 'mcp-2', 'runtime', 'rest-0', 'rest-1', 'rest-2']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -421,13 +487,20 @@ jobs:
           # and never used; the save step prunes it.
           touch "$RUNNER_TEMP/go-cache-start"
 
+      # v2 entries hold test results recorded with stable input timestamps
+      # (scripts/ci_stable_mtimes.py); v1 results were recorded against
+      # checkout times and can never match, so a v2 key makes the first main
+      # push save usable results instead of waiting for the next UTC day.
+      # The v1 fallback still supplies compiled packages until then.
       - name: Restore Go build and test-result cache
         id: go-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.go-cache-key.outputs.dir }}
-          key: go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-${{ steps.go-cache-key.outputs.day }}
+          key: go-test-v2-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-${{ steps.go-cache-key.outputs.day }}
           restore-keys: |
+            go-test-v2-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-
+            go-test-v2-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-
             go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-
             go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-
 
@@ -436,6 +509,9 @@ jobs:
 
       - name: Download dependencies
         run: bash scripts/ci-retry.sh go mod download
+
+      - name: Stabilize tracked input timestamps
+        run: python3 scripts/ci_stable_mtimes.py
 
       - name: Run tests (no race)
         env:
@@ -534,9 +610,11 @@ jobs:
       # Go marks a cache entry used by touching it, so files still older than
       # the start marker were restored and never needed. Dropping them keeps
       # each day's entry to what that day's tree uses instead of every day's
-      # leftovers. Go touches an entry only when it is over an hour old, so an
-      # entry saved less than an hour earlier can be pruned while in use; that
-      # costs a rebuild later, never a wrong result.
+      # leftovers. Go refreshes a used entry's mtime only when it is at least an
+      # hour old (mtimeInterval in cmd/go/internal/cache), so an entry written
+      # less than an hour before this run can be in use without being touched.
+      # The cutoff therefore sits an hour before the start marker; anything
+      # newer is kept.
       - name: Prune unused Go cache entries
         if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true' }}
         env:
@@ -544,7 +622,8 @@ jobs:
         run: |
           set -euo pipefail
           before="$(du -sh "$GO_CACHE_DIR" | cut -f1)"
-          find "$GO_CACHE_DIR" -type f ! -newer "$RUNNER_TEMP/go-cache-start" -delete
+          touch -r "$RUNNER_TEMP/go-cache-start" -d '-1 hour' "$RUNNER_TEMP/go-cache-cutoff"
+          find "$GO_CACHE_DIR" -type f ! -newer "$RUNNER_TEMP/go-cache-cutoff" -delete
           echo "Go cache: ${before} before pruning, $(du -sh "$GO_CACHE_DIR" | cut -f1) after"
 
       - name: Save Go build and test-result cache
@@ -552,16 +631,16 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ${{ steps.go-cache-key.outputs.dir }}
-          key: go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-${{ steps.go-cache-key.outputs.day }}
+          key: go-test-v2-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-${{ steps.go-cache-key.outputs.day }}
 
   test-oss-go127:
     needs: [security-scan, changed-files]
-    # Runs only on pull requests or merge groups that touch CI policy / Go pins (see the
-    # changed-files job). release.yaml proves every shard on the pinned Go 1.27
+    # Runs only on pull requests or merge groups that change the Go toolchain
+    # (see the changed-files job). release.yaml proves every shard on the pinned Go 1.27
     # before a tag. Running it on every PR and main push only ever caught timing
     # flakes, never a version-specific failure, while its race jobs were the
     # largest share of runner queue time for every overlapping run.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changed-files.outputs.ci_policy == 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changed-files.outputs.go_toolchain == 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     name: race-oss (1.27, ${{ matrix.shard }})
     # Two 21-minute whole-command attempts, kill grace, plus setup and upload.
@@ -577,7 +656,7 @@ jobs:
       # the plan limit, job counts, or ordinary PR workload (~52 jobs) changes.
       max-parallel: 10
       matrix:
-        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'proxy-8', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'scanner-4', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3', 'rest-4', 'rest-5', 'rest-6', 'rest-7']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -652,7 +731,7 @@ jobs:
       fail-fast: false
       max-parallel: 6
       matrix:
-        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'proxy-8', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'scanner-4', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3', 'rest-4', 'rest-5', 'rest-6', 'rest-7']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -728,12 +807,12 @@ jobs:
 
   test-enterprise-go127:
     needs: [security-scan, changed-files]
-    # Runs only on pull requests or merge groups that touch CI policy / Go pins (see the
-    # changed-files job). release.yaml proves every shard on the pinned Go 1.27
+    # Runs only on pull requests or merge groups that change the Go toolchain
+    # (see the changed-files job). release.yaml proves every shard on the pinned Go 1.27
     # before a tag. Running it on every PR and main push only ever caught timing
     # flakes, never a version-specific failure, while its race jobs were the
     # largest share of runner queue time for every overlapping run.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changed-files.outputs.ci_policy == 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changed-files.outputs.go_toolchain == 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     name: race-enterprise (1.27, ${{ matrix.shard }})
     # Two 21-minute whole-command attempts, kill grace, plus setup and upload.
@@ -749,7 +828,7 @@ jobs:
       # the plan limit, job counts, or ordinary PR workload (~52 jobs) changes.
       max-parallel: 10
       matrix:
-        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'proxy-6', 'proxy-7', 'proxy-8', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'scanner-4', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'mcp-6', 'mcp-7', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3', 'rest-4', 'rest-5', 'rest-6', 'rest-7']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -816,7 +895,7 @@ jobs:
   test-subprocess-coverage:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -858,7 +937,7 @@ jobs:
   guard-conformance:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -946,11 +1025,21 @@ jobs:
           if [ "$EVENT_NAME" = push ]; then
             echo "Main's complete race lane supplies measurements"
             echo 'changed=false' >> "$GITHUB_OUTPUT"
-          elif git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- '*_test.go'; then
-            echo "No test source changes; race measurement is a no-op"
-            echo 'changed=false' >> "$GITHUB_OUTPUT"
           else
-            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            case "$EVENT_NAME" in
+              pull_request|merge_group) ;;
+              *) echo "Unknown changed-test event: $EVENT_NAME" >&2; exit 1 ;;
+            esac
+            # Resolve before the no-change path; a failed diff is not an empty one.
+            base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            status=0
+            git diff --quiet "$base" "$HEAD_SHA" -- '*_test.go' || status=$?
+            case "$status" in
+              0) echo "No test source changes; race measurement is a no-op"
+                 echo 'changed=false' >> "$GITHUB_OUTPUT" ;;
+              1) echo 'changed=true' >> "$GITHUB_OUTPUT" ;;
+              *) exit "$status" ;;
+            esac
           fi
 
       - name: Set up Go
@@ -966,6 +1055,8 @@ jobs:
       - name: Measure changed tests and check shard budget
         if: steps.sources.outputs.changed == 'true'
         env:
+          # Both revisions must use setup-go's toolchain, without auto-upgrades.
+          GOTOOLCHAIN: local
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.sha }}
           VARIANT: ${{ matrix.variant }}
@@ -989,6 +1080,8 @@ jobs:
           path: |
             changed-tests-${{ matrix.variant }}.json
             changed-tests-${{ matrix.variant }}.selection.json
+            changed-tests-${{ matrix.variant }}.base.json
+            changed-tests-${{ matrix.variant }}.base.selection.json
           retention-days: 14
           if-no-files-found: ignore
 
@@ -1005,8 +1098,10 @@ jobs:
         run: |
           set -u
           # On a pull request or merge group, a skipped producer counts only when the
-          # classifier succeeded and said the change is documentation-only.
-          # Every other non-success result reds this required check.
+          # classifier succeeded and said the change is documentation-only, or,
+          # on a merge group alone, that a green pull request run already
+          # tested this exact tree. Every other non-success result reds this
+          # required check.
           test "${{ needs.security-scan.result }}" = "success"
           if [ "$EVENT_NAME" != "push" ]; then
             test "${{ needs.changed-files.result }}" = "success"
@@ -1017,21 +1112,27 @@ jobs:
             if [ "$EVENT_NAME" = "push" ] || [ "${{ needs.test-unit-go126.result }}" != "skipped" ]; then
               exit 1
             fi
-            test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+            if [ "$EVENT_NAME" != "merge_group" ] || [ "${{ needs.changed-files.outputs.queue_tree_tested }}" != "true" ]; then
+              test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+            fi
           fi
           echo "test-subprocess-coverage result: ${{ needs.test-subprocess-coverage.result }}"
           if ! test "${{ needs.test-subprocess-coverage.result }}" = "success"; then
             if [ "$EVENT_NAME" = "push" ] || [ "${{ needs.test-subprocess-coverage.result }}" != "skipped" ]; then
               exit 1
             fi
-            test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+            if [ "$EVENT_NAME" != "merge_group" ] || [ "${{ needs.changed-files.outputs.queue_tree_tested }}" != "true" ]; then
+              test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+            fi
           fi
           echo "guard-conformance result: ${{ needs.guard-conformance.result }}"
           if ! test "${{ needs.guard-conformance.result }}" = "success"; then
             if [ "$EVENT_NAME" = "push" ] || [ "${{ needs.guard-conformance.result }}" != "skipped" ]; then
               exit 1
             fi
-            test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+            if [ "$EVENT_NAME" != "merge_group" ] || [ "${{ needs.changed-files.outputs.queue_tree_tested }}" != "true" ]; then
+              test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+            fi
           fi
           echo "test-replay-go126 result: ${{ needs.test-replay-go126.result }}"
           test "${{ needs.test-replay-go126.result }}" = "success"
@@ -1061,9 +1162,11 @@ jobs:
     runs-on: ubuntu-latest
     # "test (1.27)" is a required check name on every PR (see the branch
     # ruleset), so it must exist even when the Go 1.27 race producers skip.
-    # On a pull request or merge group, require policy detection and a boolean
-    # output. Only an explicit false justifies skipped race producers. On a
-    # push, the policy detector and race producers intentionally skip.
+    # On a pull request or merge group, require toolchain detection and a boolean
+    # output. Only an explicit false justifies skipped race producers, or, on
+    # a merge group alone, the classifier's proof that a green pull request run
+    # already tested this exact tree. On a push, the toolchain detector and race
+    # producers intentionally skip.
     # Security scan and replay evidence must succeed on every event.
     name: test (1.27)
     timeout-minutes: 5
@@ -1086,8 +1189,8 @@ jobs:
           test "${{ needs.security-scan.result }}" = "success"
           if [ "$EVENT_NAME" != "push" ]; then
             test "${{ needs.changed-files.result }}" = "success"
-            if [ "${{ needs.changed-files.outputs.ci_policy }}" != "false" ]; then
-              test "${{ needs.changed-files.outputs.ci_policy }}" = "true"
+            if [ "${{ needs.changed-files.outputs.go_toolchain }}" != "false" ]; then
+              test "${{ needs.changed-files.outputs.go_toolchain }}" = "true"
             fi
           fi
 
@@ -1097,7 +1200,9 @@ jobs:
               exit 1
             fi
             if [ "$EVENT_NAME" != "push" ]; then
-              test "${{ needs.changed-files.outputs.ci_policy }}" = "false"
+              if [ "$EVENT_NAME" != "merge_group" ] || [ "${{ needs.changed-files.outputs.queue_tree_tested }}" != "true" ]; then
+                test "${{ needs.changed-files.outputs.go_toolchain }}" = "false"
+              fi
             fi
           fi
 
@@ -1107,7 +1212,9 @@ jobs:
               exit 1
             fi
             if [ "$EVENT_NAME" != "push" ]; then
-              test "${{ needs.changed-files.outputs.ci_policy }}" = "false"
+              if [ "$EVENT_NAME" != "merge_group" ] || [ "${{ needs.changed-files.outputs.queue_tree_tested }}" != "true" ]; then
+                test "${{ needs.changed-files.outputs.go_toolchain }}" = "false"
+              fi
             fi
           fi
 
@@ -1117,7 +1224,7 @@ jobs:
   test-macos:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -1148,7 +1255,7 @@ jobs:
   test-macos-intel:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     # GitHub's x64 image labels: https://github.com/actions/runner-images#available-images
     runs-on: macos-26-intel
     timeout-minutes: 10
@@ -1193,7 +1300,7 @@ jobs:
   test-windows:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -1249,7 +1356,7 @@ jobs:
   test-windows-arm64:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: windows-11-arm
     timeout-minutes: 15
     steps:
@@ -1320,7 +1427,7 @@ jobs:
   test-linux-arm64:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 15
     steps:
@@ -1382,7 +1489,7 @@ jobs:
   test-unsupported-filesystems:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1413,7 +1520,7 @@ jobs:
   lint:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1439,7 +1546,7 @@ jobs:
   lint-enterprise:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1575,7 +1682,7 @@ jobs:
   test-cross-target:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     name: test-cross-target (${{ matrix.target }})
     timeout-minutes: 15
@@ -1605,7 +1712,7 @@ jobs:
   helm:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1624,6 +1731,9 @@ jobs:
   govulncheck:
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
+    # It still runs on a merge group whose tree a green pull request run
+    # already tested: its verdict depends on the live vulnerability database,
+    # not only the tree, so an advisory published since then must be seen.
     if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1740,7 +1850,7 @@ jobs:
   benchmark-smoke:
     needs: [security-scan, changed-files]
     # Go-change PRs and benchmark-input changes; every main push also runs.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'push' || needs.changed-files.outputs.benchmark_smoke == 'true') }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'push' || needs.changed-files.outputs.benchmark_smoke == 'true') && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1764,7 +1874,7 @@ jobs:
     timeout-minutes: 5
     needs: [security-scan, changed-files]
     # Skipped only on a documentation-only pull request; see changed-files.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' && needs.changed-files.outputs.queue_tree_tested != 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1951,22 +2061,32 @@ jobs:
           AGENT_REVIEW_CONTRACT_RESULT: ${{ needs.agent-review-contract.result }}
           CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
           DOCS_ONLY: ${{ needs.changed-files.outputs.docs_only }}
+          QUEUE_TREE_TESTED: ${{ needs.changed-files.outputs.queue_tree_tested }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # test (1.27) accepts skipped upper-lane producers on a pull request
-          # because changed-files decided no CI-policy file changed. A failed or
+          # because changed-files decided the Go toolchain did not change. A failed or
           # cancelled classifier skips them too, so a pull request needs a
           # successful classifier here before that skip counts as intentional.
           if [ "$EVENT_NAME" != push ] && [ "$CHANGED_FILES_RESULT" != success ]; then
             echo "changed-files did not succeed, so skipped upper-lane tests are not evidence" >&2
             exit 1
           fi
+          # On a merge group alone, a successful classifier may prove that a
+          # green pull request run already tested this exact tree; producers
+          # skipped for that reason are evidence, as for documentation-only.
+          tree_skip_ok=false
+          if [ "$EVENT_NAME" = merge_group ] && [ "$CHANGED_FILES_RESULT" = success ] && [ "$QUEUE_TREE_TESTED" = true ]; then
+            tree_skip_ok=true
+          fi
           # A skipped smoke is intentional only when the successful classifier
-          # ruled out benchmark inputs. Failure or cancellation never qualifies.
+          # ruled out benchmark inputs or proved the tree already tested.
+          # Failure or cancellation never qualifies.
           if [ "$BENCHMARK_SMOKE_RESULT" != success ]; then
             if [ "$BENCHMARK_SMOKE_RESULT" != skipped ] || [ "$EVENT_NAME" = push ] || \
-               [ "$CHANGED_FILES_RESULT" != success ] || [ "$BENCHMARK_SMOKE_REQUIRED" != false ]; then
+               [ "$CHANGED_FILES_RESULT" != success ] || \
+               { [ "$BENCHMARK_SMOKE_REQUIRED" != false ] && [ "$tree_skip_ok" != true ]; }; then
               echo "benchmark smoke evidence is incomplete or failed" >&2
               exit 1
             fi
@@ -1995,7 +2115,7 @@ jobs:
             "$CROSS_TARGET_RESULT" \
             "$HELM_RESULT" \
             "$BUILD_BINARIES_RESULT"; do
-            if [ "$result" = skipped ] && [ "$docs_skip_ok" = true ]; then
+            if [ "$result" = skipped ] && { [ "$docs_skip_ok" = true ] || [ "$tree_skip_ok" = true ]; }; then
               continue
             fi
             if [ "$result" != success ]; then
@@ -2003,6 +2123,35 @@ jobs:
               exit 1
             fi
           done
+
+      # Only after the gate above passed: record the tree this pull request run
+      # proved, so a merge group with the identical tree can reuse the result.
+      # The checker also requires the whole run to have succeeded.
+      - name: Record the tree this run proved
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          TESTED_TREE: ${{ needs.changed-files.outputs.tested_tree }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TESTED_TREE" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "classifier reported no tested tree" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/ci-tested-tree"
+          printf '%s\n' "$TESTED_TREE" > "$RUNNER_TEMP/ci-tested-tree/tested-tree"
+
+      # Reuse is only an optimization: a failed upload leaves no artifact, the
+      # checker answers false, and the queue runs the full suite. It must not
+      # red this required check.
+      - name: Upload the tested tree
+        if: ${{ github.event_name == 'pull_request' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-tested-tree
+          path: ${{ runner.temp }}/ci-tested-tree/tested-tree
+          retention-days: 7
+          if-no-files-found: error
 
   # Operator-facing rollup only. Branch protection continues to evaluate the
   # required producer checks independently.
@@ -2025,6 +2174,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
           DOCS_ONLY: ${{ needs.changed-files.outputs.docs_only }}
+          QUEUE_TREE_TESTED: ${{ needs.changed-files.outputs.queue_tree_tested }}
         run: |
           set -euo pipefail
           failed=0
@@ -2033,19 +2183,25 @@ jobs:
           printf '%s\n\n' '| Required check | Evidence |' >> "$summary"
           printf '%s\n' '| --- | --- |' >> "$summary"
 
-          docs_skip_ok=false
+          skip_reason=""
+          tree_reused=false
           if [ "$EVENT_NAME" != push ] && [ "$CHANGED_FILES_RESULT" = success ] && [ "$DOCS_ONLY" = true ]; then
-            docs_skip_ok=true
+            skip_reason="documentation only"
+          elif [ "$EVENT_NAME" = merge_group ] && [ "$CHANGED_FILES_RESULT" = success ] && [ "$QUEUE_TREE_TESTED" = true ]; then
+            skip_reason="tree already tested by a green pull request run"
+            tree_reused=true
           fi
 
-          # A third argument marks a producer a documentation-only pull request
-          # skips on purpose.
+          # A third argument marks a producer that may skip on purpose: "docs"
+          # only for a documentation-only pull request, "any" also for a merge
+          # group whose tree was already tested.
           record_result() {
             local name="$1"
             local result="$2"
             local docs_skippable="${3:-}"
-            if [ "$result" = skipped ] && [ -n "$docs_skippable" ] && [ "$docs_skip_ok" = true ]; then
-              printf '| %s | skipped (documentation only) |\n' "$name" >> "$summary"
+            if [ "$result" = skipped ] && [ -n "$docs_skippable" ] && [ -n "$skip_reason" ] && \
+               { [ "$docs_skippable" = any ] || [ "$tree_reused" = false ]; }; then
+              printf '| %s | skipped (%s) |\n' "$name" "$skip_reason" >> "$summary"
               return
             fi
             printf '| %s | %s |\n' "$name" "$result" >> "$summary"
@@ -2058,8 +2214,8 @@ jobs:
           record_result 'security-scan' "$SECURITY_SCAN_RESULT"
           record_result 'test (1.26)' "$TEST_GO126_RESULT"
           record_result 'test (1.27)' "$TEST_GO127_RESULT"
-          record_result 'test-macos' "$MACOS_RESULT" docs
-          record_result 'lint' "$LINT_RESULT" docs
+          record_result 'test-macos' "$MACOS_RESULT" any
+          record_result 'lint' "$LINT_RESULT" any
           record_result 'build' "$BUILD_RESULT"
           record_result 'govulncheck' "$GOVULNCHECK_RESULT" docs
 

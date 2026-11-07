@@ -34,6 +34,7 @@ These techniques use Unicode characters to break pattern matching.
 | Technique | Example | Status | How |
 |-----------|---------|----------|-----|
 | Zero-width characters | `sk\u200b-ant` (ZW space in key) | Tested | 16 Unicode ranges stripped before matching |
+| Unicode Tags | U+E0020–U+E007E | Tested | Printable ASCII tags decoded beside the stripped view; framing tags dropped |
 | NFKC normalization bypass | `ﬁle` (fi ligature) | Tested | NFKC decomposition applied to all scanned text |
 | Homoglyphs (Cyrillic) | `аpi_kеy` (Cyrillic a and e) | Tested | 80+ confusable character mappings |
 | Homoglyphs (Greek/Armenian/Cherokee) | `αpi`, `օverride` | Tested | Extended confusable map covers major scripts |
@@ -44,6 +45,8 @@ These techniques use Unicode characters to break pattern matching.
 | Regional indicators / emoji | Boxed letters, flag sequences | Tested | Stripped by zero-width/variation selector removal |
 | Exotic whitespace | `\u00A0`, `\u2000`-`\u200A`, `\u3000`, etc. | Tested | `StripExoticWhitespace` removes 18 Unicode space codepoints before DLP matching |
 | Zalgo text | `t̷̺̀e̸̜̅s̵̲̈́t̵̙̅` (stacked combining marks) | Tested | `StripCombiningMarks` removes all marks; `ZalgoDensity` detects 3+ consecutive marks as suspicious for taint signaling |
+
+Unicode tag decoding follows the [Unicode Standard, Chapter 23, Tags](https://www.unicode.org/versions/latest/core-spec/chapter-23/). DLP scans both stripped and tag-decoded views for URL paths and queries, outbound text, configured environment/file secrets, and canary values. Response injection scanning checks tag-decoded text with the same patterns as other decoded views. Mixed visible text and other invisible characters retain their usual normalization. Decoding shares the existing candidate/work budgets and response recursion limit; outbound inspection that exhausts its decode budget is refused. A tag sequence alone does not trigger a finding. Cross-request fragment matching also retains both views when enabled, with the existing retention limits and source-request attribution.
 
 ## DNS-Based Exfiltration
 
@@ -56,7 +59,9 @@ These techniques leak data through DNS queries rather than HTTP bodies.
 | High-entropy subdomains | `jk3n4k5n.evil.com` | Tested | Shannon entropy > 4.0 on labels > 8 chars |
 | Subdomain rotation | `a.evil.com`, `b.evil.com`, `c.evil.com` | Tested | Rate limiting and data budget keyed on the registrable base domain (public-suffix eTLD+1, not just the last two labels) |
 
-**Key design choice:** DLP and subdomain entropy run at layers 3-4, before DNS resolution at layer 6. This means secrets are caught before any DNS query leaves the proxy.
+URL DLP uses the Public Suffix List to separate the registrable domain from its subdomain prefix. It removes dots from that prefix and passes it through the existing bounded decoders, including hex, base32, base32hex and base64url ([RFC 4648](https://www.rfc-editor.org/rfc/rfc4648)). Both the immutable core floor and configured DLP inspect the decoded views for credential matches. Label boundaries can occur anywhere within the encoding; DNS labels have a 63-octet limit (the size limits section of [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035)). Base32 decoding accepts lowercase DNS spellings; base64url decoding preserves case. This is content detection within one hostname, not reconstruction across requests or arbitrary encoding schemes.
+
+**Key design choice:** DLP and subdomain entropy run before DNS resolution. Credential matches in these views are refused before the proxy resolves the destination. This applies to fetch URLs, forward-proxy URLs and CONNECT hostnames routed through Pipelock; direct DNS requires containment or network policy.
 
 ## Slow/Chunked Exfiltration
 

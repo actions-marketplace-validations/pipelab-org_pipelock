@@ -8,12 +8,25 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
 )
+
+// File-valued tools use the same names and presentation aliases as the shipped
+// rules. Their arguments can contain filename whitespace; shell arguments must
+// keep their command parsing rather than acquiring cleaned command spellings.
+var pathValueToolName = regexp.MustCompile(`(?i)^(?:` + builtinToolNameAliasPrefix + `)?(?:` +
+	fileReadToolPattern + `|` + fileWriteToolPattern + `|` + fileMoveToolPattern + `|` +
+	fileCopyToolPattern + `|` + fileLinkToolPattern + `|` + filePatchToolPattern + `|` +
+	fileDeleteToolPattern + `|` + fileMetadataToolPattern + `)$`)
 
 // Tool policy matches the path text a caller submits. A filesystem backend
 // acts on the file that text resolves to, and the two differ whenever a link is
@@ -200,14 +213,15 @@ type localProtectedCandidate struct {
 // resolved paths and the protected spelling of any protected location they
 // reach. It returns values unchanged when nothing new is found.
 func (l *localPathIdentity) expand(values []string) []string {
-	out, _ := l.expandNoted(values)
+	out, _ := l.expandNoted(values, true)
 	return out
 }
 
 // expandNoted is expand plus the operator-facing notes for every protected
 // directory whose hard-link walk was inconclusive, so a block caused by the
 // fail-closed rule can say so instead of showing only the rule it matched.
-func (l *localPathIdentity) expandNoted(values []string) ([]string, []string) {
+func (l *localPathIdentity) expandNoted(values []string, pathValues bool) ([]string, []string) {
+	values = withPathSpellings(values, pathValues)
 	if l == nil || len(values) == 0 {
 		return values, nil
 	}
@@ -270,7 +284,7 @@ func (l *localPathIdentity) expandNoted(values []string) ([]string, []string) {
 // different to the kernel than to a lexical cleaner, and both are resolved.
 func (l *localPathIdentity) paths(value string, baseIsProtected func(string) bool) []string {
 	if value == "" || len(value) > localPathMaxLen || strings.ContainsAny(value, "\x00\n\r") ||
-		strings.Contains(value, "://") {
+		normalize.HasHierarchicalScheme(value) {
 		return nil
 	}
 	switch {
@@ -728,4 +742,170 @@ func withPatchPrefixStripped(targets []string) []string {
 		}
 	}
 	return out
+}
+
+// withPathSpellings adds the spellings a file backend acts on when they differ
+// from the submitted text and need no access to the backend's filesystem: the
+// path of a file URI, percent-decoded as URI readers decode it (a malformed
+// escape is kept verbatim while every valid escape around it is decoded, with
+// one further bounded decode when a doubly-encoded escape remains), and the
+// lexically cleaned form of a path that carries a parent segment or a
+// backslash separator, which many servers compute before opening the file and
+// which needs no intermediate directory to exist. A backslash counts as a
+// separator for the cleaned form. It runs with or without local path identity,
+// so a remote upstream gets the same view. File URI views also include WHATWG
+// input preprocessing. Spaces and tabs in literal paths are kept as filename
+// characters. The added strings join the submitted ones; nothing is replaced.
+func withPathSpellings(values []string, pathValues bool) []string {
+	var extra []string
+	seen := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		seen[v] = struct{}{}
+	}
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		if _, ok := seen[s]; ok {
+			return
+		}
+		seen[s] = struct{}{}
+		extra = append(extra, s)
+	}
+	// addPath adds a path's cleaned views, and when it still carries a percent
+	// escape, one further bounded decode so a doubly-encoded segment resolves
+	// the way a decoding reader would see it.
+	addPath := func(p string) {
+		add(p)
+		addCleaned(p, add)
+		if d, ok := decodeOnce(p); ok {
+			add(d)
+			addCleaned(d, add)
+		}
+	}
+	for _, v := range values {
+		if v == "" || len(v) > localPathMaxLen {
+			continue
+		}
+		uri := normalize.URLInput(v)
+		if isFileURI(uri) {
+			// Retain both readers' meanings: literal whitespace may be part of
+			// a filename for net/url, while a WHATWG reader preprocesses it.
+			for _, spelling := range []string{v, uri} {
+				if p, ok := fileURIPath(spelling); ok {
+					addPath(p)
+				} else if raw, ok := fileURIRemainder(spelling); ok {
+					// URL file readers exclude literal query/fragment delimiters;
+					// escaped delimiters remain filename bytes after decoding.
+					if i := strings.IndexAny(raw, "?#"); i >= 0 {
+						raw = raw[:i]
+					}
+					// Lenient readers keep malformed escapes and decode valid
+					// escapes around them before resolving parent segments.
+					addCleaned(raw, add)
+					decoded := normalize.PercentUnescapePartial(raw)
+					addPath(decoded)
+					// With no base URL, WHATWG file state roots an opaque
+					// spelling such as file:etc/shadow at the filesystem root.
+					// Keep the relative reading too for other file URI readers.
+					if !strings.HasPrefix(decoded, "/") && !strings.HasPrefix(decoded, `\`) {
+						addPath("/" + decoded)
+					}
+				}
+			}
+			continue
+		}
+		if strings.ContainsAny(v, "\x00\n\r") || normalize.HasHierarchicalScheme(v) ||
+			(!pathValues && strings.ContainsAny(v, " \t")) {
+			continue
+		}
+		if hasParentSegment(v) || strings.Contains(v, `\`) {
+			addCleaned(v, add)
+		}
+	}
+	if len(extra) == 0 {
+		return values
+	}
+	return append(append([]string(nil), values...), extra...)
+}
+
+// addCleaned adds the lexically cleaned form of p. A backend that treats a
+// backslash as a separator cleans a different path than path.Clean, which
+// only knows the slash, so when p has a backslash the form with each backslash
+// read as a slash is cleaned and added as well.
+func addCleaned(p string, add func(string)) {
+	add(path.Clean(p))
+	if strings.Contains(p, `\`) {
+		add(path.Clean(strings.ReplaceAll(p, `\`, "/")))
+	}
+}
+
+// decodeOnce returns one further percent-decode of p, but only when p still
+// holds a percent escape and the decode changes it, so a doubly-encoded path a
+// reader decodes a second time is matched without an unbounded decode loop. A
+// malformed escape is kept verbatim and every valid escape is still decoded,
+// as a lenient reader does, so one bad escape cannot hide a valid one.
+func decodeOnce(p string) (string, bool) {
+	if !strings.Contains(p, "%") {
+		return "", false
+	}
+	d := normalize.PercentUnescapePartial(p)
+	if d == p {
+		return "", false
+	}
+	return d, true
+}
+
+// isFileURI reports whether v begins with the file: scheme.
+func isFileURI(v string) bool {
+	return len(v) >= len("file:") && strings.EqualFold(v[:len("file:")], "file:")
+}
+
+// fileURIPath returns the decoded path of a file URI.
+func fileURIPath(v string) (string, bool) {
+	if !isFileURI(v) {
+		return "", false
+	}
+	u, err := url.Parse(v)
+	if err != nil || u.Path == "" {
+		return "", false
+	}
+	return u.Path, true
+}
+
+// fileURIRemainder strips the file: scheme and any // authority from a file
+// URI whose path url.Parse could not extract, returning the best-effort raw
+// path so later cleaning still sees a parent segment or backslash left in it.
+// The authority ends at the first slash or backslash, as in the WHATWG URL
+// file host state, so a backslash-separated path after "//" keeps its view.
+func fileURIRemainder(v string) (string, bool) {
+	if !isFileURI(v) {
+		return "", false
+	}
+	if _, ok := fileURIPath(v); ok {
+		return "", false
+	}
+	rest := v[len("file:"):]
+	if strings.HasPrefix(rest, "//") {
+		rest = rest[2:]
+		if i := strings.IndexAny(rest, `/\`); i >= 0 {
+			rest = rest[i:]
+		} else {
+			rest = ""
+		}
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
+}
+
+// hasParentSegment reports whether v has a ".." path segment.
+func hasParentSegment(v string) bool {
+	for _, seg := range strings.FieldsFunc(v, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }

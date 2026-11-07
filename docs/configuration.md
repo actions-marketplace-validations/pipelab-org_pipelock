@@ -978,6 +978,8 @@ dlp:
 | `include_defaults` | `true` | Merge your patterns with the 65 built-in patterns |
 | `patterns` | 65 built-in | DLP credential detection patterns |
 | `patterns[].validator` | `""` | Post-match checksum validator: `luhn`, `mod97`, `aba`, `wif`, `dea`, or `npi` |
+| `patterns[].keywords` | `[]` | Optional literal, case-insensitive nearby labels for custom patterns; 1 to 50 terms, each 3 to 90 Unicode scalar values before and after DLP normalization |
+| `patterns[].keyword_window` | `50` with keywords | Characters on each side of the candidate, from 1 to 300; every keyword must fit wholly within one side; requires nonempty keywords |
 | `patterns[].exempt_domains` | `[]` | Domains where this pattern is not enforced (wildcard supported) |
 | `patterns[].action` | `""` | Per-pattern action override. Only `warn` is supported. When set to `warn`, matches allow traffic through without enforcement. See the [false positive tuning guide](guides/false-positive-tuning.md) for the rollout workflow. Built-in default patterns cannot be set to warn. |
 
@@ -1015,6 +1017,36 @@ dlp:
       severity: low
       validator: aba
 ```
+
+### Nearby keywords for custom patterns
+
+Use `keywords` to narrow a noisy custom detector to values with a nearby label:
+
+```yaml
+dlp:
+  patterns:
+    - name: "Customer account number"
+      regex: '[0-9]{16}'
+      severity: high
+      keywords: ["account", "customer id"]
+      keyword_window: 50
+```
+
+A finding must pass the regex, any existing `validator:`, and the keyword condition. Keywords reduce noise for accidental leaks and do not stop deliberate exfiltration. An agent can omit the label. Prefer the [per-pattern checksum validators](#validated-patterns) as the stronger structural control when the identifier format has a checksum. Known-value scanning through `scan_env` or `secrets_file` doesn't depend on nearby labels.
+
+Keywords are literal, case-insensitive substrings after DLP normalization. `api.key` includes a literal dot; `key` can match inside `monkey`. A complete keyword must occur outside the candidate and wholly within either side's window. Windows count Unicode scalar values, including ordinary spaces, tabs and newlines, rather than bytes or grapheme clusters. A keyword inside the regex match cannot corroborate itself. Either the source window outside the exact encoded candidate hull or the decoded window that produced the candidate may qualify. Whitespace and separator compaction do not shorten the source distance. If required context cannot be inspected within the existing decode budget, the existing inspection-incomplete policy applies.
+
+For URL DLP, if a decoded candidate cannot be mapped to an exact source window, a keyword anywhere in the raw URL or its existing decoded and normalized DLP views qualifies, even beyond `keyword_window`. Exact windows still apply when mapping succeeds, and exhausted inspection budgets still refuse inspection.
+
+Omitted, null, blank, or empty `keywords` keep ordinary matching. An omitted, null, or blank `keyword_window` uses 50 when keywords exist. Explicit windows must be integers from 1 to 300 and at least as long as every term. A non-null window without keywords is an error. Terms must be valid UTF-8, contain 3 to 90 Unicode scalar values before and after normalization, and have no controls, leading/trailing whitespace, or duplicates under normalization and case folding. Internal spaces and punctuation remain literal. The optional keywords, list and term bounds, default distance, and distance range follow [AWS Macie custom data identifiers](https://docs.aws.amazon.com/macie/latest/user/cdis-options.html). Pipelock searches both sides and requires disjoint context.
+
+Core patterns, compiled defaults, and unchanged canonical built-in detectors reject keywords. Custom replacements with different non-core regexes can use them. Existing presets and signed rule bundles don't add this control; bundle YAML rejects these fields. Upgrade engines before activating configuration that uses them.
+
+Enabling a gate, removing a keyword, replacing terms without retaining the old set, or shrinking the window produces an existing coverage-reduction warning on reload. Strict and required-receipt contracts reject such reloads and retain the active generation. Adding terms, enlarging the window, removing the gate, and equivalent order/case/default spellings don't produce that keyword warning. Startup warns that unlabeled values are excluded.
+
+Traffic consumers share candidate acceptance in the scanner: fetch, forward proxy and CONNECT destination checks use URL DLP; HTTP headers and bodies, intercepted CONNECT content, outbound WebSocket text, and MCP stdio/HTTP/SSE/WebSocket content use text DLP. The control adds no scan to fetch responses or server-to-client WebSocket text, which remain injection-only, or to encrypted CONNECT bodies without interception. Existing stream and structured-content joins keep their boundaries. Git scanning evaluates an added line. `pipelock audit` scans with built-in patterns; its `--config` option supplies suppressions and does not activate custom DLP patterns or their keywords. Sentry privacy scrubbing deliberately ignores keywords and still redacts unlabeled regex matches.
+
+Accepted findings retain the credential-only span and value identity. Receipts bind the effective keyword policy through configuration identity; a credential transform recipe alone doesn't independently prove nearby context. A missing keyword produces no custom finding or warn event. Other detectors and the calling surface's action still apply.
 
 ### Pattern Merging
 
@@ -1162,7 +1194,16 @@ Values shaped like a filesystem path are not collected, whatever the variable is
 
 A copied fragment of a collected environment secret is caught too, starting at 16 bytes. A value longer than 4,096 bytes, such as an inline certificate or JSON key, is indexed at up to 4,081 evenly spaced 16-byte positions instead of every position, so a fragment is caught once it is long enough to cover one of them: about 18 bytes for an 8 KiB value and about 48 bytes for the largest single environment string Linux allows (128 KiB). Canary tokens use the same index. A single long value no longer stops Pipelock from starting.
 
-DLP decoding accepts hex, percent-encoding, standard and URL-safe base64, RFC 4648 base32 in any ASCII case, RFC 4648 base32hex, JSON `\uXXXX` escapes, and HTML character references in URL query values. It does not decode Crockford base32, z-base-32, base58, ascii85, rot13, or reversed text.
+DLP decoding accepts hex, percent-encoding, standard and URL-safe base64, RFC 4648 base32 in any ASCII case, RFC 4648 base32hex, JSON `\uXXXX` escapes, and HTML character references in URL query values. The shared URL and text DLP decode graph also supports:
+
+- Decimal character-code runs, using the same parser as known-secret and canary matching. A run needs at least eight valid Unicode code points. Integral decimal and exponent forms are accepted; invalid, fractional, negative, and surrogate values end a run. Digits embedded in words or other encoding syntax aren't a numeric-literal list.
+- Octal and binary character-code runs with an explicit `0o`/`0O` or `0b`/`0B` prefix on every number, following the [ECMAScript numeric literal grammar](https://tc39.es/ecma262/multipage/ecmascript-language-lexical-grammar.html#sec-literals-numeric-literals). They use the same eight-code-point floor. Commas and spaces can separate codes. Bare binary digits, legacy leading-zero octal, and separators inside a numeric literal aren't inferred.
+- [Quoted-printable byte escapes and soft line breaks](https://www.rfc-editor.org/rfc/rfc2045#section-6.7), including CRLF and local LF line endings. Malformed escapes stay verbatim while valid escapes remain inspectable.
+- Base64 runs mixing the [standard and URL-safe alphabets](https://www.rfc-editor.org/rfc/rfc4648#section-5). The symbols `+` and `-` both represent 62, and `/` and `_` both represent 63, so the mapping is unambiguous. Padding and invalid bytes retain the existing decoder checks.
+
+These views also feed inbound prompt-injection scanning, with its existing recursion ceiling. Text DLP is shared by request bodies, scanned headers, WebSocket text, and MCP arguments; response injection scanning is shared by fetch, scanned forward/TLS-intercepted responses, WebSocket text, and MCP responses. CONNECT traffic without TLS interception has no body view. Structured numeric response leaves remain limited to known-value matching; they aren't fed to pattern DLP or injection scanning.
+
+The decode graph keeps its existing candidate and byte budgets. Unfinished outbound decoding produces an inspection refusal rather than a clean result. DLP doesn't decode IIS `%uXXXX` escapes, Crockford base32, z-base-32, base58, ascii85, rot13, or reversed text.
 
 ## Seed Phrase Detection
 
@@ -1266,7 +1307,7 @@ Warn-only observations carry the available destination, agent label, transport, 
 
 ## Response Scanning
 
-Scans fetched content for prompt injection before returning to the agent. Uses a 6-pass normalization pipeline: zero-width stripping, word boundary reconstruction, leetspeak folding, optional-whitespace matching, vowel folding, and encoding detection.
+Scans fetched content for prompt injection before returning to the agent. Uses a 6-pass normalization pipeline: zero-width stripping, word boundary reconstruction, leetspeak folding, optional-whitespace matching, vowel folding, and encoding detection. Unicode Tags are also decoded to printable ASCII and checked beside the stripped view, including in mixed visible text. Tag presence alone does not trigger a finding.
 
 Response scanning evaluates each HTTP response on its own. Forward, TLS-intercepted, and reverse proxy traffic refuses every partial (`206`) and not-modified (`304`) response with `response_incomplete` before response-scan exemptions, Shield exemptions, media policy, or budget truncation. Fetch can return partial responses when its response policies permit them. A fetch client that joins partial responses should treat the completed document as untrusted and scan it before use, because content whose meaning appears only in the combined text may not be detected.
 

@@ -318,13 +318,14 @@ func isLowConfidenceInboundAWSAccessID(ctx inboundAWSAccessIDContext, match Text
 
 // TextDLPMatch describes a single DLP pattern match in arbitrary text.
 type TextDLPMatch struct {
+	keywordGated      bool
 	genericCard       bool
 	cardPrefixRetry   bool
 	numberOnlyCardRun bool
 	informational     bool
 	PatternName       string `json:"pattern_name"`
 	Severity          string `json:"severity"`
-	Encoded           string `json:"encoded,omitempty"` // "", "base64", "hex", "base32", "env", "url", "subdomain", "whitespace"
+	Encoded           string `json:"encoded,omitempty"` // Encoding of the matched view; empty for plaintext.
 	Bundle            string `json:"bundle,omitempty"`
 	BundleVersion     string `json:"bundle_version,omitempty"`
 	Warn              bool   `json:"warn,omitempty"`            // true for warn-mode patterns (informational only)
@@ -361,6 +362,10 @@ func (m TextDLPMatch) Span() MatchSpan {
 func (m TextDLPMatch) ValueIdentity() ([32]byte, bool) {
 	return m.valueIdentity, m.hasValueIdentity
 }
+
+// RequiresKeywordContext reports that extracting this value from its context
+// must not erase an already-established receipt redaction obligation.
+func (m TextDLPMatch) RequiresKeywordContext() bool { return m.keywordGated }
 
 // IsNumberOnlyCardRun reports a card match assembled solely from two or more
 // typed JSON number integer components. It is evidence, never a block trigger.
@@ -855,6 +860,9 @@ func (s *Scanner) scanTextForDLPWithDecodes(ctx context.Context, text string, op
 // not refused at a decode bound: exfiltration is an outbound threat, and
 // large legitimate downloads must keep their delivery contract.
 func (s *Scanner) scanTextForDLPDetectors(ctx context.Context, text string, opts textDLPOptions, decodes *decodingMemo) TextDLPResult {
+	if decodes == nil && s.hasDLPKeywords() {
+		decodes = &decodingMemo{}
+	}
 	if decodes != nil {
 		decodes.inbound = !opts.scanSecretLeak || inboundDirection(ctx)
 	}
@@ -880,8 +888,27 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	text = exciseImagesRetainingDecodedForDLP(text)
 	text = redactOfficialAWSExampleCredentialsForDocs(text)
 	cleaned := decodes.normalize(text)
+	if decodes != nil {
+		priorKeywordUnit, priorKeywordInput := decodes.keywordUnit, decodes.keywordInput
+		defer func() { decodes.keywordUnit, decodes.keywordInput = priorKeywordUnit, priorKeywordInput }()
+	}
+	if s.hasDLPKeywords() {
+		decodes.keywordMode = true
+		decodes.keywordUnit = config.DLPKeywordContext(text)
+		decodes.keywordInput = text
+		decodes.registerKeywordTransform(decodes.keywordUnit, cleaned, "projection")
+	}
 	segmentViews := textDLPEncodingSegmentViews(cleaned)
 	segmentDecodeViews := segmentViews
+	// Decode before normalization can erase the tag alphabet. Segment the
+	// admitted tag views too: surrounding prose must not hide another encoding.
+	if normalize.ContainsTags(text) {
+		for _, d := range decodes.decode(text, true) {
+			if d.encoding == encodingUnicodeTags {
+				segmentDecodeViews = appendUniqueTextDLPViews(segmentDecodeViews, textDLPEncodingSegmentViews(decodes.normalize(d.text))...)
+			}
+		}
+	}
 	htmlDecoded := decodes.decodeHTML(cleaned)
 	if htmlDecoded != cleaned {
 		segmentDecodeViews = appendUniqueTextDLPViews(segmentDecodeViews, textDLPEncodingSegmentViews(htmlDecoded)...)
@@ -967,6 +994,25 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 			}
 		}
 		appendInvisibleSpacedSeedCandidate(text, "", ViewForMatching)
+		// Character-code lists and fully escaped quoted-printable text can
+		// lose their word boundaries when split into individual segments.
+		for _, view := range appendTextEncodingViews(nil, text) {
+			label := spanViewLabel(view.encoding+"_decoded", ViewForMatching)
+			addSeedCandidate(seedCandidate{view.text, view.encoding, label})
+			appendInvisibleSpacedSeedCandidate(view.text, view.encoding, label)
+			if view.encoding == encodingQuotedPrintable {
+				// Binary padding must not attach to a phrase's first or last
+				// word. Keep each decoded text run separate; joining across a
+				// non-text boundary could manufacture a phrase.
+				for run := range strings.FieldsFuncSeq(view.text, func(r rune) bool {
+					return !isPrintableResponseRune(r, 1)
+				}) {
+					runLabel := spanViewLabel(label, "text_run")
+					addSeedCandidate(seedCandidate{run, view.encoding, runLabel})
+					appendInvisibleSpacedSeedCandidate(run, view.encoding, runLabel)
+				}
+			}
+		}
 		// URL-decoded variant
 		if decoded := IterativeDecode(seedText); decoded != seedText {
 			addSeedCandidate(seedCandidate{decoded, "url", spanViewLabel("url_decoded", ViewForMatching)})
@@ -1008,6 +1054,31 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 				appendInvisibleSpacedSeedCandidate(d.text, d.encoding, spanViewLabel(d.encoding+"_decoded", "text_segment"))
 			}
 		}
+		// Seed matching preserves word boundaries. Expand tag-bearing raw and
+		// existing decoded candidates through the shared bounded graph, without
+		// normalizing unrelated binary decodes into additional seed views.
+		appendTagSeedCandidates := func(candidateText string) {
+			if !normalize.ContainsTags(candidateText) {
+				return
+			}
+			for _, d := range decodes.decode(candidateText, true) {
+				label := spanViewLabel(d.encoding+"_decoded", ViewForMatching)
+				if d.encoding == encodingUnicodeTags {
+					label = ViewUnicodeTagsDecoded
+					for _, segment := range textDLPSegments(d.text) {
+						for _, nested := range decodes.decode(segment, true) {
+							addSeedCandidate(seedCandidate{normalize.ForMatching(nested.text), nested.encoding, spanViewLabel(nested.encoding+"_decoded", "text_segment")})
+						}
+					}
+				}
+				addSeedCandidate(seedCandidate{normalize.ForMatching(d.text), d.encoding, label})
+				appendInvisibleSpacedSeedCandidate(d.text, d.encoding, label)
+			}
+		}
+		appendTagSeedCandidates(text)
+		for _, candidate := range candidates {
+			appendTagSeedCandidates(candidate.text)
+		}
 		for _, c := range candidates {
 			if seedMatches := seedprotect.DetectSpans(c.text, s.seedMinWords, s.seedVerifyChecksum); len(seedMatches) > 0 {
 				span := seedMatches[0]
@@ -1037,8 +1108,10 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	// NFKC, cross-script confusable mapping, and combining mark removal.
 	// Must match response scanning depth - otherwise attackers use homoglyphs
 	// in key prefixes (e.g., sk-օnt-... with Armenian օ U+0585 for 'a').
+	var canaryMatches []TextDLPMatch
 	if opts.patterns != textDLPCardPatterns {
-		matches = append(matches, s.scanCanaryTextWithDecodes(cleaned, decodes)...)
+		canaryMatches = s.scanCanaryTextWithDecodes(text, decodes)
+		matches = append(matches, canaryMatches...)
 	}
 
 	// Check raw text against DLP patterns (before URL decoding).
@@ -1048,8 +1121,9 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 		if !opts.patterns.includes(p.genericCard) {
 			continue
 		}
-		if start, end, ok := p.matchSpanInView(cleaned, text); ok {
+		if start, end, ok := p.matchSpanWithDecodes(cleaned, text, decodes); ok {
 			matches = append(matches, TextDLPMatch{
+				keywordGated:                        p.keywords != nil,
 				genericCard:                         p.genericCard,
 				cardPrefixRetry:                     p.cardPrefixRetry,
 				PatternName:                         p.name,
@@ -1071,11 +1145,13 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	// Iterative URL-decode and re-check DLP patterns (catches %2D → - etc.).
 	// Uses IterativeDecode to defeat multi-layer encoding.
 	if decoded := IterativeDecode(cleaned); decoded != cleaned {
-		matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatterns(decoded, "url"))...)
+		decodes.registerKeywordTransform(cleaned, decoded, encodingURL)
+		matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsWithDecodes(decoded, encodingURL, decoded, decodes))...)
 	}
 
 	if htmlDecoded != cleaned {
-		matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatterns(htmlDecoded, encodingHTML))...)
+		decodes.registerKeywordTransform(cleaned, htmlDecoded, encodingHTML)
+		matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsWithDecodes(htmlDecoded, encodingHTML, htmlDecoded, decodes))...)
 		matches = append(matches, s.decodeAndMatchWithDecodes(htmlDecoded, decodes, opts.patterns)...)
 	}
 
@@ -1083,9 +1159,16 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	// percent-decoding give up on the whole token. A receiver that drops the
 	// invalid escapes recovers the credential, so match that view too.
 	if strings.Contains(cleaned, "%") {
-		for _, dropped := range invalidPercentEscapeViews(cleaned) {
+		for i, dropped := range invalidPercentEscapeViews(cleaned) {
 			if dropped != cleaned {
-				matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsInView(IterativeDecode(dropped), encodingURL, cleaned))...)
+				encoding := keywordPercentDrop
+				if i == 1 {
+					encoding = keywordPercentEscapeDrop
+				}
+				decodes.registerKeywordTransform(cleaned, dropped, encoding)
+				decoded := IterativeDecode(dropped)
+				decodes.registerKeywordTransform(dropped, decoded, encodingURL)
+				matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsWithDecodes(decoded, encodingURL, cleaned, decodes))...)
 			}
 		}
 	}
@@ -1096,12 +1179,13 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	if strings.Contains(cleaned, ".") {
 		dotless := removeHostnameDots(cleaned)
 		if dotless != cleaned {
-			matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsInView(dotless, "subdomain", cleaned))...)
+			matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsWithDecodes(dotless, "subdomain", cleaned, decodes))...)
 		}
 	}
 
 	if len(segmentViews) > 1 {
 		compacted, offsets := decodes.compactWhitespace(cleaned)
+		decodes.registerKeywordTransform(cleaned, compacted, "projection")
 		matches = append(matches, opts.patterns.selectMatches(s.matchDLPPatternsInWhitespaceView(compacted, cleaned, offsets))...)
 	}
 
@@ -1132,6 +1216,9 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	// until no new bounded candidates appear. Catches base64(secret),
 	// hex(secret), and nested chains (e.g., base64(hex(secret))).
 	matches = append(matches, s.decodeAndMatchWithDecodes(cleaned, decodes, opts.patterns)...)
+	if normalize.ContainsTags(text) || (hasTextEncoding(text) && text != cleaned) {
+		matches = append(matches, s.decodeAndMatchWithDecodes(text, decodes, opts.patterns)...)
+	}
 
 	// Segment-level encoding detection: split text on URL/path delimiters and
 	// try decoding each segment individually. Catches encoded secrets embedded
@@ -1163,13 +1250,22 @@ func (s *Scanner) scanTextForDLPDetectorsInner(ctx context.Context, text string,
 	if opts.scanSecretLeak {
 		matches = append(matches, s.checkSecretsInTextWithDecodes(s.envSecrets, cleaned, "Environment Variable Leak", "env", decodes)...)
 		matches = append(matches, s.checkSecretsInTextWithDecodes(s.fileSecrets, cleaned, "Known Secret Leak", "", decodes)...)
+		if normalize.ContainsTags(text) || (hasTextEncoding(text) && text != cleaned) {
+			matches = append(matches, s.checkSecretsInTextWithDecodes(s.envSecrets, text, "Environment Variable Leak", "env", decodes)...)
+			matches = append(matches, s.checkSecretsInTextWithDecodes(s.fileSecrets, text, "Known Secret Leak", "", decodes)...)
+		}
 	}
 
 	// Deduplicate matches by pattern name + encoding.
 	matches = deduplicateMatches(matches)
 
-	// Prepend core matches - core findings cannot be overridden.
+	// Retain every core finding, with configured canary attribution first.
+	// A canary can also have a credential's shape; its encoding provenance
+	// must not be hidden behind the pattern finding for the same value.
 	if len(coreMatches) > 0 {
+		if len(canaryMatches) > 0 {
+			coreMatches = append(canaryMatches[:len(canaryMatches):len(canaryMatches)], coreMatches...)
+		}
 		matches = append(coreMatches, matches...)
 		matches = deduplicateMatches(matches)
 	}
@@ -1243,6 +1339,17 @@ func (s *Scanner) matchDLPPatternsNormalized(text, encoding, proseSource string)
 // matchDLPPatternsLowered is matchDLPPatternsNormalized for a text whose
 // lowered bytes are already recorded, limited to the rules in patterns.
 func (s *Scanner) matchDLPPatternsLowered(text, encoding, proseSource string, lowered *dlpLoweredBytes, patterns textDLPPatternSet) []TextDLPMatch {
+	return s.matchDLPPatternsLoweredWithDecodes(text, encoding, proseSource, lowered, patterns, nil)
+}
+
+func (s *Scanner) matchDLPPatternsWithDecodes(text, encoding, source string, decodes *decodingMemo) []TextDLPMatch {
+	text = normalize.ForDLP(text)
+	var lowered dlpLoweredBytes
+	lowered.add(text)
+	return s.matchDLPPatternsLoweredWithDecodes(text, encoding, source, &lowered, textDLPAllPatterns, decodes)
+}
+
+func (s *Scanner) matchDLPPatternsLoweredWithDecodes(text, encoding, proseSource string, lowered *dlpLoweredBytes, patterns textDLPPatternSet, decodes *decodingMemo) []TextDLPMatch {
 	var matches []TextDLPMatch
 	var shape dlpShapeSummary
 	for _, idx := range s.dlpPreFilter.patternsToCheckWith(text, lowered) {
@@ -1253,8 +1360,9 @@ func (s *Scanner) matchDLPPatternsLowered(text, encoding, proseSource string, lo
 		if s.dlpPreFilter.shapeRejects(p.shapeGate, text, &shape) {
 			continue
 		}
-		if start, end, ok := p.matchSpanInView(text, proseSource); ok {
+		if start, end, ok := p.matchSpanWithDecodes(text, proseSource, decodes); ok {
 			matches = append(matches, TextDLPMatch{
+				keywordGated:                        p.keywords != nil,
 				genericCard:                         p.genericCard,
 				cardPrefixRetry:                     p.cardPrefixRetry,
 				PatternName:                         p.name,
@@ -1292,6 +1400,7 @@ func (s *Scanner) matchDLPPatternsInWhitespaceView(text, proseSource string, off
 				continue
 			}
 			matches = append(matches, TextDLPMatch{
+				keywordGated:                        p.keywords != nil,
 				genericCard:                         p.genericCard,
 				cardPrefixRetry:                     p.cardPrefixRetry,
 				PatternName:                         p.name,
@@ -1489,6 +1598,8 @@ func (s *Scanner) checkSecretsInTextWithDecodes(secrets []string, text, patternN
 		return nil
 	}
 
+	original := text
+	text = decodes.normalize(text)
 	texts := []spanTextView{{text: text, viewLabel: ViewDLPNormalized}}
 	lowerTexts := []spanTextView{{text: strings.ToLower(text), viewLabel: lowerViewLabel(ViewDLPNormalized)}}
 	// Form decoding turns an escaped '+' into a space; the RFC 3986 view keeps
@@ -1504,6 +1615,9 @@ func (s *Scanner) checkSecretsInTextWithDecodes(secrets []string, text, patternN
 	for phase := range 2 {
 		if phase == 1 {
 			texts = s.decodedKnownSecretViews(text, decodes)
+			if original != text && (hasTextEncoding(original) || normalize.ContainsTags(original)) {
+				texts = append(texts, s.decodedKnownSecretViews(original, decodes)...)
+			}
 			// URL serialization can escape a separator into path data. Split
 			// the decoded view too, as known-value URL scanning already does.
 			if decoded != text {
@@ -1729,6 +1843,17 @@ func isHexText(s string) bool {
 // replay keeps '#' inside a segment.
 func textDLPSegments(text string) []string {
 	segments := strings.FieldsFunc(text, isTextDLPEncodingDelimiter)
+	// RFC 4648 section 4 includes '/' in the base64 alphabet. Retain the
+	// existing encoded-run recognizer's whole runs beside URL-like pieces,
+	// so path separators do not destroy a standard-base64 carrier.
+	if strings.Contains(text, "/") {
+		for _, run := range extractEncodedRunSpans(text, minSegmentDecodeLen) {
+			// Whole-content decoding already inspects a run equal to text.
+			if run.text != text && strings.Contains(run.text, "/") {
+				segments = append(segments, run.text)
+			}
+		}
+	}
 	if !strings.Contains(text, "#") {
 		return segments
 	}

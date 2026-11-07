@@ -10,11 +10,14 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/net/idna"
+
 	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -273,14 +276,92 @@ func scanMCPResourceURI(ctx context.Context, method string, params json.RawMessa
 	if uri == "" {
 		return mcpResourceURIParserFinding("missing resources/read uri")
 	}
-	lower := strings.ToLower(uri)
-	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+	view, ok, err := httpResourceURLView(uri)
+	if !ok {
 		return nil
 	}
-	if result := sc.Scan(ctx, uri); !result.Allowed {
+	if err != nil {
+		return mcpResourceURIParserFinding(fmt.Sprintf("invalid resource URL host: %v", err))
+	}
+	// Preserve checks on a submitted HTTP(S) URL without consuming a second
+	// rate-limit slot. The resolved view below records the actual request.
+	lower := strings.ToLower(uri)
+	if view != uri && (strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")) {
+		if result := sc.ScanPreflight(ctx, uri); !result.Allowed {
+			return []scanner.Result{result}
+		}
+	}
+	if result := sc.Scan(ctx, view); !result.Allowed {
 		return []scanner.Result{result}
 	}
 	return nil
+}
+
+// httpResourceURLView returns the HTTP(S) URL a WHATWG URL reader makes of
+// uri, or false when that reader would not treat it as HTTP(S). It applies
+// the standard's input preprocessing and its separator handling for special
+// schemes before the authority.
+func httpResourceURLView(uri string) (string, bool, error) {
+	s := normalize.URLInput(uri)
+	colon := strings.IndexByte(s, ':')
+	if colon <= 0 {
+		return "", false, nil
+	}
+	scheme := strings.ToLower(s[:colon])
+	if scheme != "http" && scheme != "https" {
+		return "", false, nil
+	}
+	rest := strings.TrimLeft(s[colon+1:], `/\`)
+	end := strings.IndexAny(rest, "?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	rest = strings.ReplaceAll(rest[:end], `\`, "/") + rest[end:]
+	authority, err := asciiAuthorityHost(rest)
+	return scheme + "://" + authority, true, err
+}
+
+// WHATWG URL Standard, domain parser ToASCII with beStrict=false. The shared
+// destination.LookupASCII profile validates configured DNS names using STD3;
+// URL hosts also permit characters such as underscores. Keep this local to the
+// resource URL view rather than changing configured-domain matching.
+var resourceHostIDNAProfile = idna.New(
+	idna.MapForLookup(),
+	idna.BidiRule(),
+	idna.CheckHyphens(false),
+	idna.StrictDomainName(false),
+)
+
+// asciiAuthorityHost rewrites the host of rest (authority, then any path,
+// query or fragment) the way the WHATWG host parser reads a host that is not
+// plain ASCII: percent-decoded, then mapped with UTS 46, so an ideographic full
+// stop or a full-width digit reads as the address it names and meets the
+// literal-address floor. An IPv6 literal, a host with neither a non-ASCII byte
+// nor an escape come back unchanged. A rejected mapping returns an error so
+// the caller cannot mistake an uninspected destination for a clean resource.
+func asciiAuthorityHost(rest string) (string, error) {
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	authority, tail := rest[:end], rest[end:]
+	at := strings.LastIndexByte(authority, '@')
+	userinfo, hostport := authority[:at+1], authority[at+1:]
+	if strings.HasPrefix(hostport, "[") {
+		return rest, nil
+	}
+	host, port := hostport, ""
+	if colon := strings.LastIndexByte(hostport, ':'); colon >= 0 {
+		host, port = hostport[:colon], hostport[colon:]
+	}
+	if !strings.ContainsFunc(host, func(r rune) bool { return r >= 0x80 || r == '%' }) {
+		return rest, nil
+	}
+	ascii, err := resourceHostIDNAProfile.ToASCII(normalize.PercentUnescapePartial(host))
+	if err != nil || ascii == "" {
+		return "", fmt.Errorf("host mapping failed")
+	}
+	return userinfo + ascii + port + tail, nil
 }
 
 func mcpResourceURIParserFinding(reason string) []scanner.Result {
