@@ -31,6 +31,11 @@ const (
 	keywordSegment = "segment"
 )
 
+type keywordEdgeKey struct {
+	node, parent *keywordDecodeSource
+	encoding     string
+}
+
 // keywordDecodeSources records edges of the existing decoder walk, only for
 // scans with contextual rules. It neither adds views nor changes admission.
 // It is scan-local: source-sensitive decisions never enter shared decode caches.
@@ -40,6 +45,10 @@ type keywordDecodeSources struct {
 	nodes       map[string]*keywordDecodeSource
 	budget      *keywordWorkBudget
 	incomplete  bool
+	// bound records variant parent/encoding pairs. It is filled from the
+	// variant slice on first use so a later duplicate check stays exact.
+	bound      map[keywordEdgeKey]struct{}
+	boundReady map[*keywordDecodeSource]struct{}
 }
 
 type keywordSourceOccurrences struct {
@@ -52,9 +61,35 @@ type keywordWorkBudget struct {
 	occurrences   map[keywordProjectionKey]*keywordSourceOccurrences
 	sourceVersion uint64
 	used          int
-	nodes         int
-	incomplete    bool
+	// searchBytes counts parent bytes read while locating a literal segment.
+	// The per-occurrence visit charge stays separate.
+	searchBytes int
+	nodes       int
+	incomplete  bool
+	// ancestorGen stamps source-cycle checks for this scan budget. Graphs that
+	// share a budget are walked from the scan that owns the memo, on one
+	// goroutine, so the stamp map is not synchronized.
+	ancestorGen   uint64
+	ancestorSeen  map[*keywordDecodeSource]uint64
+	ancestorStack []*keywordDecodeSource
 }
+
+// keywordSegmentSearch is one literal segment edge's repeat decision and
+// occurrence list. Keyword graphs live on the scan's decodingMemo, not in
+// the shared decode cache, and text matching walks that memo on the calling
+// goroutine. The mapped and logical fields on the same node are already
+// unsynchronized for that reason, so this cache is too.
+type keywordSegmentSearch struct {
+	repeat int8
+	at     []int
+	from   int
+	done   bool
+}
+
+const (
+	segmentRepeatUnique int8 = 1
+	segmentRepeatMany   int8 = 2
+)
 
 type keywordDecodeSource struct {
 	reassembly         *assembledKeywordBits
@@ -68,6 +103,7 @@ type keywordDecodeSource struct {
 	owner              *keywordDecodeSources
 	offsets            []keywordByteSpan
 	mapped             bool
+	segmentSearch      *keywordSegmentSearch
 }
 
 func newKeywordDecodeSources(root string) *keywordDecodeSources {
@@ -118,10 +154,8 @@ func (s *keywordDecodeSources) add(parent, text, encoding string) *keywordDecode
 		if text == s.root || node == p || node.parent == p && node.encoding == encoding {
 			return node
 		}
-		for _, variant := range node.variants {
-			if variant.parent == p && variant.encoding == encoding {
-				return node
-			}
+		if s.variantBound(node, p, encoding) {
+			return node
 		}
 		// A repeated decoder view can carry another source map. Keep its edge
 		// without expanding the decode graph or adding another decoded view.
@@ -132,7 +166,7 @@ func (s *keywordDecodeSources) add(parent, text, encoding string) *keywordDecode
 			return node
 		}
 		s.budget.sourceVersion++
-		node.variants = append(node.variants, &keywordDecodeSource{text: text, encoding: encoding, parent: p, owner: s})
+		s.addVariant(node, &keywordDecodeSource{text: text, encoding: encoding, parent: p, owner: s})
 		return node
 	}
 	if !s.chargeNode() {
@@ -143,7 +177,79 @@ func (s *keywordDecodeSources) add(parent, text, encoding string) *keywordDecode
 	return node
 }
 
+func (s *keywordDecodeSources) variantBound(node, parent *keywordDecodeSource, encoding string) bool {
+	s.ensureVariantIndex(node)
+	_, ok := s.bound[keywordEdgeKey{node: node, parent: parent, encoding: encoding}]
+	return ok
+}
+
+func (s *keywordDecodeSources) ensureVariantIndex(node *keywordDecodeSource) {
+	if node == nil {
+		return
+	}
+	if _, ready := s.boundReady[node]; ready {
+		return
+	}
+	if s.bound == nil {
+		s.bound = make(map[keywordEdgeKey]struct{})
+		s.boundReady = make(map[*keywordDecodeSource]struct{})
+	}
+	for _, variant := range node.variants {
+		s.bound[keywordEdgeKey{node: node, parent: variant.parent, encoding: variant.encoding}] = struct{}{}
+	}
+	s.boundReady[node] = struct{}{}
+}
+
+func (s *keywordDecodeSources) addVariant(node, variant *keywordDecodeSource) {
+	node.variants = append(node.variants, variant)
+	if _, ready := s.boundReady[node]; ready {
+		s.bound[keywordEdgeKey{node: node, parent: variant.parent, encoding: variant.encoding}] = struct{}{}
+	}
+}
+
 func (n *keywordDecodeSource) hasSourceAncestor(target *keywordDecodeSource) bool {
+	if n != nil && n.owner != nil && n.owner.budget != nil {
+		return n.hasSourceAncestorStamped(target)
+	}
+	return keywordAncestorAlloc(n, target)
+}
+
+// hasSourceAncestorStamped walks the same edges as the allocating search. The
+// seen set lives on the scan budget. A generation of zero is empty, so the
+// counter starts at one.
+func (n *keywordDecodeSource) hasSourceAncestorStamped(target *keywordDecodeSource) bool {
+	budget := n.owner.budget
+	if budget.ancestorGen == ^uint64(0) {
+		budget.ancestorSeen = nil
+		budget.ancestorGen = 0
+	}
+	budget.ancestorGen++
+	gen := budget.ancestorGen
+	if budget.ancestorSeen == nil {
+		budget.ancestorSeen = make(map[*keywordDecodeSource]uint64)
+	}
+	seen := budget.ancestorSeen
+	stack := append(budget.ancestorStack[:0], n)
+	found := false
+	for len(stack) > 0 {
+		next := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if next == target {
+			found = true
+			break
+		}
+		if next == nil || seen[next] == gen {
+			continue
+		}
+		seen[next] = gen
+		stack = append(stack, next.parent)
+		stack = append(stack, next.variants...)
+	}
+	budget.ancestorStack = stack[:0]
+	return found
+}
+
+func keywordAncestorAlloc(n, target *keywordDecodeSource) bool {
 	pending := []*keywordDecodeSource{n}
 	seen := make(map[*keywordDecodeSource]bool)
 	for len(pending) > 0 {
@@ -186,6 +292,15 @@ func (n *keywordDecodeSource) visitSources(start, end int, visit func(string, in
 func (n *keywordDecodeSource) visitOneSource(start, end int, visit func(string, int, int) bool) bool {
 	if n.parent == nil {
 		return visit(n.text, start, end)
+	}
+	// A repeated literal segment has no single offset map. Visit every
+	// occurrence so a later labeled copy can still qualify. The repeat
+	// decision and the positions are cached for this edge, including a
+	// negative decision, so later candidates do not rescan the parent.
+	if n.encoding == keywordSegment && n.text != "" {
+		if handled, matched := n.visitLiteralSegment(start, end, visit); handled {
+			return matched
+		}
 	}
 	if n.encoding == "identity" && n.parent.text == n.text {
 		// Identity edges keep every byte position. Building and charging a
@@ -379,10 +494,10 @@ func (s *keywordDecodeSources) visitOccurrences(source, root string, visit func(
 		}
 	}
 	for !entry.done && entry.from <= len(source)-len(root) {
-		if !s.charge(len(root) + keywordSpanBytes) {
+		at, _, ok := s.chargedIndex(source, entry.from, root)
+		if !ok {
 			return false
 		}
-		at := strings.Index(source[entry.from:], root)
 		if at < 0 {
 			entry.done = true
 			break
@@ -976,11 +1091,7 @@ func (s *keywordDecodeSources) bindParents(text string, parents []*keywordDecode
 		if root.parent == parent && root.encoding == encoding {
 			continue
 		}
-		duplicate := false
-		for _, variant := range root.variants {
-			duplicate = duplicate || variant.parent == parent && variant.encoding == encoding
-		}
-		if duplicate {
+		if s.variantBound(root, parent, encoding) {
 			continue
 		}
 		if root.parent == nil {
@@ -993,7 +1104,7 @@ func (s *keywordDecodeSources) bindParents(text string, parents []*keywordDecode
 			return
 		}
 		s.budget.sourceVersion++
-		root.variants = append(root.variants, &keywordDecodeSource{text: text, encoding: encoding, parent: parent, owner: s})
+		s.addVariant(root, &keywordDecodeSource{text: text, encoding: encoding, parent: parent, owner: s})
 	}
 }
 
@@ -1051,4 +1162,115 @@ func keywordQueryValueOffsets(source, view string) []keywordByteSpan {
 		from += len(pair) + 1
 	}
 	return offsets
+}
+
+// visitLiteralSegment walks a segment edge. handled is false only when the
+// segment occurs once, so the caller keeps the single-copy offset map.
+// Occurrence positions are cached. A qualifying copy returns before later
+// copies are searched, and every visit pays the per-occurrence charge.
+func (n *keywordDecodeSource) visitLiteralSegment(start, end int, visit func(string, int, int) bool) (bool, bool) {
+	if n.parent == nil || start < 0 || end > len(n.text) || end <= start {
+		n.owner.incomplete = true
+		return true, false
+	}
+	if n.segmentSearch == nil {
+		cost := int(reflect.TypeFor[keywordSegmentSearch]().Size())
+		if !n.owner.charge(cost) {
+			return true, false
+		}
+		n.segmentSearch = &keywordSegmentSearch{}
+	}
+	st := n.segmentSearch
+	if st.repeat == segmentRepeatUnique {
+		return false, false
+	}
+	if st.repeat != segmentRepeatMany {
+		for len(st.at) < 2 {
+			rel, ok := n.indexSegment(st.from)
+			if !ok {
+				return true, false
+			}
+			if rel < 0 {
+				st.repeat = segmentRepeatUnique
+				st.done = true
+				st.at = nil
+				return false, false
+			}
+			st.at = append(st.at, st.from+rel)
+			st.from += rel + 1
+		}
+		st.repeat = segmentRepeatMany
+	}
+	for _, at := range st.at {
+		if !n.chargeSegmentVisit() {
+			return true, false
+		}
+		if n.parent.visitSources(at+start, at+end, visit) {
+			return true, true
+		}
+	}
+	for !st.done {
+		rel, ok := n.indexSegment(st.from)
+		if !ok {
+			return true, false
+		}
+		if rel < 0 {
+			st.done = true
+			break
+		}
+		at := st.from + rel
+		st.at = append(st.at, at)
+		st.from = at + 1
+		if !n.chargeSegmentVisit() {
+			return true, false
+		}
+		if n.parent.visitSources(at+start, at+end, visit) {
+			return true, true
+		}
+	}
+	return true, false
+}
+
+func (n *keywordDecodeSource) chargeSegmentVisit() bool {
+	return n.owner.charge(len(n.text) + keywordSpanBytes)
+}
+
+// indexSegment locates the next literal copy at or after from. ok is false
+// only when the keyword allowance cannot pay for the suffix. rel is negative
+// when no copy remains.
+func (n *keywordDecodeSource) indexSegment(from int) (int, bool) {
+	parent, segment := n.parent.text, n.text
+	if segment == "" || from > len(parent)-len(segment) {
+		return -1, true
+	}
+	rel, examined, ok := n.owner.chargedIndex(parent, from, segment)
+	if !ok {
+		return -1, false
+	}
+	n.owner.budget.searchBytes += examined
+	return rel, true
+}
+
+// chargedIndex runs strings.Index over haystack[from:] against the keyword
+// allowance. It refuses before reading a suffix the remaining allowance
+// cannot pay for, recording the refusal the way a failed charge does, and
+// otherwise charges the bytes the search examined plus one span. rel is
+// relative to from and negative when needle does not occur.
+func (s *keywordDecodeSources) chargedIndex(haystack string, from int, needle string) (rel, examined int, ok bool) {
+	suffixLen := len(haystack) - from
+	room := maxDecodeTotalBytes - s.budget.used
+	if keywordSpanBytes >= room || suffixLen > room-keywordSpanBytes {
+		s.incomplete = true
+		s.budget.incomplete = true
+		return -1, 0, false
+	}
+	rel = strings.Index(haystack[from:], needle)
+	examined = suffixLen
+	if rel >= 0 {
+		examined = rel + len(needle)
+	}
+	if !s.charge(examined + keywordSpanBytes) {
+		return -1, 0, false
+	}
+	return rel, examined, true
 }
