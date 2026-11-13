@@ -20,6 +20,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/reqpolicy"
+	"github.com/luckyPipewrench/pipelock/internal/responseencoding"
 )
 
 // blockLayerRequestPolicy labels request_policy decisions on receipts and audit
@@ -63,6 +64,15 @@ type requestPolicyInput struct {
 	Headers     http.Header // resolved for method-override detection
 	Body        []byte
 	BodyRead    bool
+	// Config is the configuration the request was admitted under. When set,
+	// the body limit comes from it, so a reload between admission and the body
+	// read cannot change the limit this request is held to.
+	Config *config.Config
+	// WireBody is the original compressed body when Body is the decoded view.
+	// WireBodySet distinguishes that original, including an empty one, from
+	// an identity body that was not decoded.
+	WireBody    []byte
+	WireBodySet bool
 
 	Transport string
 	Target    string // full URL or host:port, for receipt/audit correlation
@@ -225,8 +235,11 @@ func (p *Proxy) evaluateRequestPolicyUninspectableBatch(in requestPolicyInput, a
 	return d
 }
 
-func (p *Proxy) requestPolicyBodyLimit() int {
-	cfg := p.cfgPtr.Load()
+func (p *Proxy) requestPolicyBodyLimit(admitted *config.Config) int {
+	cfg := admitted
+	if cfg == nil {
+		cfg = p.cfgPtr.Load()
+	}
 	if cfg != nil && cfg.RequestBodyScanning.MaxBodyBytes > 0 {
 		return cfg.RequestBodyScanning.MaxBodyBytes
 	}
@@ -245,21 +258,41 @@ func (p *Proxy) prepareRequestPolicyBody(r *http.Request, in *requestPolicyInput
 		in.BodyRead = true
 		return requestPolicyResult{}
 	}
-	limit := p.requestPolicyBodyLimit()
-	buf, err := io.ReadAll(io.LimitReader(r.Body, int64(limit)+1))
+	limit := p.requestPolicyBodyLimit(in.Config)
+	raw, err := io.ReadAll(io.LimitReader(r.Body, int64(limit)+1))
 	if err != nil {
 		return p.requestPolicyReadBlocked(*in, fmt.Sprintf("request body could not be inspected: %v", err))
 	}
-	if len(buf) > limit {
+	if len(raw) > limit {
 		return p.requestPolicyReadBlocked(*in, fmt.Sprintf("request body exceeds max_body_bytes (%d)", limit))
 	}
-	r.Body = io.NopCloser(bytes.NewReader(buf))
-	r.ContentLength = int64(len(buf))
-	bufCopy := buf
-	r.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(bufCopy)), nil
+	// A single gzip, x-gzip, or deflate body is matched on its decoded text
+	// and forwarded as sent. A coding this path does not decode, or a body
+	// that does not decode completely, is left as read: it then fails to
+	// parse like any other unreadable body, and on_parse_error and
+	// on_opaque_operation decide it, as they did before this path decoded
+	// anything. A decoded size over the limit is refused like any oversized
+	// body.
+	inspected := raw
+	wire := raw
+	if coding, codingErr := responseencoding.ParseRequestCoding(r.Header.Values("Content-Encoding")); codingErr == nil && coding != "" {
+		decoded, decErr := responseencoding.ReadDecoded(coding, raw, limit)
+		if decErr == nil {
+			if len(decoded) > limit {
+				return p.requestPolicyReadBlocked(*in, fmt.Sprintf("request body exceeds max_body_bytes (%d)", limit))
+			}
+			inspected = decoded
+			in.WireBody = append([]byte(nil), wire...)
+			in.WireBodySet = true
+		}
 	}
-	in.Body = buf
+	r.Body = io.NopCloser(bytes.NewReader(wire))
+	r.ContentLength = int64(len(wire))
+	wireCopy := wire
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(wireCopy)), nil
+	}
+	in.Body = inspected
 	in.BodyRead = true
 	return requestPolicyResult{}
 }
@@ -273,13 +306,14 @@ func (p *Proxy) prepareRequestPolicyBody(r *http.Request, in *requestPolicyInput
 // shared finalizer so it is metered, audited, and receipted like any other
 // match. reason is logged as bounded audit context for the failure cause.
 func (p *Proxy) requestPolicyReadBlocked(in requestPolicyInput, reason string) requestPolicyResult {
-	m := p.requestPolicyMatcher()
-	if m == nil {
-		return requestPolicyResult{}
-	}
 	p.logger.LogAnomaly(in.AuditCtx, blockLayerRequestPolicy, reason, 0)
 	d := p.evaluateRequestPolicyUninspectable(in, config.ActionBlock, reqpolicy.PredAnyBody)
 	d = reqpolicy.Stricter(d, p.evaluateRequestPolicyUninspectableBatch(in, config.ActionBlock))
+	// A reload can remove the matching rule during the read. A shadow rule
+	// also cannot make a partially consumed stream safe to forward.
+	if !d.Enforced() || d.Action != config.ActionBlock {
+		d = reqpolicy.Decision{Action: config.ActionBlock, RuleName: "body_uninspectable", Reason: "request body could not be inspected"}
+	}
 	return p.finalizeRequestPolicyDecision(in, d)
 }
 
