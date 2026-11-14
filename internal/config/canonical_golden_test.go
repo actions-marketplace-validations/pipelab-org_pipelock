@@ -468,7 +468,10 @@ const (
 	// widened the Slack and Vault patterns.
 	// Re-bumped when the Vault service body became base64url with a
 	// case-insensitive prefix, matching the published token example.
-	goldenHashDefaults = "7333694c0057d783b714a771195b271f801327965366c531606a2fadaed256b7"
+	// Re-bumped for request_policy.on_undecodable_encoding: a body in a
+	// coding the request-policy path does not decode is blocked by default,
+	// separate from on_parse_error. The field is present in Defaults().
+	goldenHashDefaults = "18223abfc4915506c11a3a654d76b8262c79a0b6fc18115b5486cc174b02ed2b"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -717,7 +720,9 @@ const (
 	// Re-bumped with goldenHashDefaults for the sign-in bearer carrier.
 	// Re-bumped with goldenHashDefaults for the Bedrock, Heroku, and Vault corpus change.
 	// Re-bumped with goldenHashDefaults for the Vault service base64url body.
-	goldenHashRichConfig = "3fe270abdc85401c24051b0d749f2905c7693671993ae4618e87d3a48358f440"
+	// Re-bumped for request_policy.on_undecodable_encoding. The rich fixture
+	// omits request_policy, so ApplyDefaults fills the new field.
+	goldenHashRichConfig = "c5cd076024e835e5233c5edc24434f66c3c1bbce37f713022a16dca294486848"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
@@ -1247,6 +1252,15 @@ func loadGoldenConfig(t *testing.T, yamlSrc string) *Config {
 	return cfg
 }
 
+// policyHashGoldenHint is appended to every policy-hash golden failure. The
+// goldens pin different inputs and stay independent, but one new or changed
+// default config field usually moves all of them.
+const policyHashGoldenHint = "\n\nPolicy hashes are pinned in three places that move separately. Check each:\n" +
+	"  internal/config/canonical_golden_test.go (goldenHashDefaults, goldenHashRichConfig, TestCanonicalPolicyHash_NewToolAdmissionVocabularyGolden)\n" +
+	"  internal/config/dlp_keywords_test.go (TestDLPKeywordsLegacyPolicyHashGolden)\n" +
+	"  internal/proxy/testdata/decision-inventory-policy.golden.jsonl\n" +
+	"    regenerate: go test ./internal/proxy -run '^TestDecisionInventory$' -update-decision-inventory"
+
 // TestCanonicalPolicyHash_GoldenDefaults pins the canonical hash of
 // the out-of-the-box Defaults() config. Any drift in this value after
 // a refactor means Defaults() or a component of policySemanticView
@@ -1260,7 +1274,7 @@ func TestCanonicalPolicyHash_GoldenDefaults(t *testing.T) {
 	}
 	got := cfg.computeCanonicalPolicyHash()
 	if got != goldenHashDefaults {
-		t.Errorf("Defaults() canonical hash drifted.\n  want %s\n  got  %s\n\nIf this is an intentional policy-semantics change, update goldenHashDefaults and document the bump in the PR body.", goldenHashDefaults, got)
+		t.Errorf("Defaults() canonical hash drifted.\n  want %s\n  got  %s\n\nIf this is an intentional policy-semantics change, update goldenHashDefaults and document the bump in the PR body.%s", goldenHashDefaults, got, policyHashGoldenHint)
 	}
 }
 
@@ -1272,7 +1286,7 @@ func TestCanonicalPolicyHash_GoldenRichConfig(t *testing.T) {
 	cfg := loadGoldenConfig(t, goldenRichYAML)
 	got := cfg.computeCanonicalPolicyHash()
 	if got != goldenHashRichConfig {
-		t.Errorf("rich-config canonical hash drifted.\n  want %s\n  got  %s\n\nIf this is an intentional policy-semantics change, update goldenHashRichConfig and document the bump in the PR body.", goldenHashRichConfig, got)
+		t.Errorf("rich-config canonical hash drifted.\n  want %s\n  got  %s\n\nIf this is an intentional policy-semantics change, update goldenHashRichConfig and document the bump in the PR body.%s", goldenHashRichConfig, got, policyHashGoldenHint)
 	}
 }
 
@@ -1291,14 +1305,14 @@ func TestCanonicalPolicyHash_NewToolAdmissionVocabularyGolden(t *testing.T) {
 		// Gateway carrier, the publisher SDK Together host and the JWT sign-in
 		// bearer carrier, matching the default and rich-config goldens above.
 		// They inherit the RFC 9110 default URI limit of 8000 octets.
-		{name: "admit remains warn", admission: NewToolAdmit, wantHash: "f9c55c9d4e0101be7bfcf888edfc5638aeec37eefb3a07b7888c8333311bd314"},
-		{name: "withhold remains block", admission: NewToolWithhold, wantHash: "6a4548caa4e9e70ade406fc36e369984993f040536d9249fb9b6ea8966cb0c55"},
+		{name: "admit remains warn", admission: NewToolAdmit, wantHash: "2e5cfd12fde5a1b67d801124b67d5271d1a0732e22296886f3390ed4b76e0ba6"},
+		{name: "withhold remains block", admission: NewToolWithhold, wantHash: "8a843b58c296a2dc06c2bd8643dd068c5da2e514e72f187ccccc776573b55500"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := loadGoldenConfig(t, "mcp_tool_scanning:\n  enabled: true\n  action: warn\n  detect_drift: true\n  new_tool_admission: "+tt.admission+"\n")
 			if got := cfg.computeCanonicalPolicyHash(); got != tt.wantHash {
-				t.Errorf("new-tool admission canonical hash drifted: want %s, got %s", tt.wantHash, got)
+				t.Errorf("new-tool admission canonical hash drifted: want %s, got %s%s", tt.wantHash, got, policyHashGoldenHint)
 			}
 		})
 	}
