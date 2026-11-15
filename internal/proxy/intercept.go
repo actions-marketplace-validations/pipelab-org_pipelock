@@ -1169,24 +1169,28 @@ func newInterceptHandler(
 			ic.Logger.LogAnomaly(actx, urlResult.Scanner, urlResult.Reason, urlResult.Score)
 		}
 
+		gitPushObserved := false
 		if gitPush := evaluateGitPushAllowlist(ic.Config.GitProtection, r.Method, r.URL); gitPush.Block {
-			ic.Logger.LogBlocked(actx, "git_protection", gitPush.Reason)
-			ic.Metrics.RecordTLSRequestBlocked("git_protection")
-			_ = interceptEmitReceipt(ic, receipt.EmitOpts{
-				ActionID:  actionID,
-				Verdict:   config.ActionBlock,
-				Layer:     "git_protection",
-				Pattern:   gitPush.Reason,
-				Transport: "intercept",
-				Method:    r.Method,
-				Target:    targetURL,
-				RequestID: ic.RequestID,
-				Agent:     ic.Agent,
-			})
-			writeBlockedError(w,
-				blockInfoFor(blockreason.RequestPolicyDeny, "git_protection").WithRequestID(ic.RequestID),
-				"blocked: "+gitPush.Reason, http.StatusForbidden)
-			return
+			block, observed := ic.Proxy.refuseGitPushAllowlist(ic.Config, ic.Logger, actx, gitPush, gitPush.Reason)
+			if block {
+				ic.Metrics.RecordTLSRequestBlocked(scanner.AuditGitProtection)
+				_ = interceptEmitReceipt(ic, receipt.EmitOpts{
+					ActionID:  actionID,
+					Verdict:   config.ActionBlock,
+					Layer:     scanner.AuditGitProtection,
+					Pattern:   gitPush.Reason,
+					Transport: "intercept",
+					Method:    r.Method,
+					Target:    targetURL,
+					RequestID: ic.RequestID,
+					Agent:     ic.Agent,
+				})
+				writeBlockedError(w,
+					blockInfoFor(blockreason.RequestPolicyDeny, scanner.AuditGitProtection).WithRequestID(ic.RequestID),
+					"blocked: "+gitPush.Reason, http.StatusForbidden)
+				return
+			}
+			gitPushObserved = observed
 		}
 
 		// A2A protocol detection: check path and Content-Type for A2A traffic.
@@ -1925,6 +1929,7 @@ func newInterceptHandler(
 			ceeRec, ceeBlockAll := ceeRecordSignalsAndBlockAll(ceeSignalParams{
 				Result: ceeRes, Sessions: admission.Sessions, SessionKey: sessionKey,
 				AdaptiveCfg: &admission.AdaptiveConfig, Logger: ic.Logger, Metrics: ic.Metrics,
+				Scope:    interceptAdaptiveScope(ic),
 				ClientIP: ic.ClientIP, RequestID: ic.RequestID,
 			})
 
@@ -1963,7 +1968,7 @@ func newInterceptHandler(
 					writeBlockedError(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer).WithRequestID(ic.RequestID), session.ErrCapacity.Error(), http.StatusServiceUnavailable)
 					return
 				}
-				level := recEscalationLevel(ceeRec)
+				_, level := adaptiveBlockState(ceeRec, interceptAdaptiveScope(ic))
 				recordAdaptiveUpgrade(ic.Logger, ic.Metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: ic.ClientIP, RequestID: ic.RequestID})
 				ic.Metrics.RecordTLSRequestBlocked(adaptiveSessionDeny)
 				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
@@ -2030,6 +2035,7 @@ func newInterceptHandler(
 
 		// request_policy runs before the contract gate so a contract allow can
 		// never suppress an operation-policy block.
+		interceptPolicyObserved := gitPushObserved
 		if ic.Proxy != nil {
 			rpInput := requestPolicyInput{
 				Host:        r.URL.Hostname(),
@@ -2061,6 +2067,8 @@ func newInterceptHandler(
 				ic.Metrics.RecordTLSRequestBlocked(blockLayerRequestPolicy)
 				writeBlockedError(w, rp.Info.WithRequestID(ic.RequestID), "blocked by request policy: "+rp.Reason, http.StatusForbidden)
 				return
+			} else if rp.Observed {
+				interceptPolicyObserved = true
 			}
 		}
 
@@ -3232,8 +3240,13 @@ func newInterceptHandler(
 		// must not contribute to score decay. Responses from scan-exempt hosts
 		// earn no credit, matching the forward and fetch paths. So do structural
 		// exemptions, which are adaptive-neutral.
-		if structured == nil && ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding && !interceptAuthenticatedArtifact && !interceptRespExempt && recoveryAssessment.IsBenign() && !urlResult.IsStructuralExemption() {
-			ic.Recorder.RecordClean(ic.Config.AdaptiveEnforcement.DecayPerCleanRequest)
+		if structured == nil && ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding && !interceptAuthenticatedArtifact && !interceptRespExempt && recoveryAssessment.IsBenign() && !urlResult.IsStructuralExemption() && !interceptPolicyObserved {
+			recordCleanForAdaptiveScope(ic.Recorder, interceptAdaptiveScope(ic), &ic.Config.AdaptiveEnforcement, true, adaptiveRecoveryContext{
+				assessment: recoveryAssessment,
+				sessionKey: sessionKeyFor(ic.Config, ic.Agent, ic.ClientIP, ic.ActorAuth),
+				scope:      interceptAdaptiveScope(ic), reason: adaptiveRecoveryClean,
+				clientIP: ic.ClientIP, requestID: ic.RequestID, logger: ic.Logger, metrics: ic.Metrics,
+			})
 		}
 
 		// Record response size for per-domain data budget tracking.

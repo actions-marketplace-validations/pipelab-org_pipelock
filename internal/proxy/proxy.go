@@ -150,6 +150,11 @@ const (
 	// valid presigned or GitHub-issued SAS URL). The request's deferred clean
 	// credit then skips it, as it does for a direct exemption.
 	ctxKeyRedirectStructuralExemption
+	// ctxKeyRequestPolicyObserved carries a *atomic.Bool set when the admitted
+	// request, or a redirect hop, observed a configured request-policy block
+	// or a configured git-push allowlist mismatch. Clean adaptive credit skips
+	// that request.
+	ctxKeyRequestPolicyObserved
 	// ctxKeyRedirectAirlockSession carries the adaptive session key into
 	// CheckRedirect so every hop admits airlock against the same state the
 	// writer raised. Request-controlled identities use the folded CEE-safe key;
@@ -1184,8 +1189,16 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 			// admitted request.
 			if gitPush := evaluateGitPushAllowlist(currentCfg.GitProtection, req.Method, req.URL); gitPush.Block {
 				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
-				logger.LogBlocked(actx, "git_protection", "redirect from "+originalURL+" blocked: "+gitPush.Reason)
-				return newRedirectBlockedRequest("git_protection", gitPush.Reason)
+				blockedDetail := "redirect from " + originalURL + " blocked: " + gitPush.Reason
+				block, observed := p.refuseGitPushAllowlist(currentCfg, logger, actx, gitPush, blockedDetail)
+				if block {
+					return newRedirectBlockedRequest(scanner.AuditGitProtection, gitPush.Reason)
+				}
+				if observed {
+					if flag, ok := req.Context().Value(ctxKeyRequestPolicyObserved).(*atomic.Bool); ok && flag != nil {
+						flag.Store(true)
+					}
+				}
 			}
 			redirectRec, _ := req.Context().Value(ctxKeyRedirectSessionRecorder).(session.Recorder)
 			redirectTaint := evaluateHTTPTaint(currentCfg, redirectRec, req.Method, req.URL)
@@ -1236,6 +1249,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 			if rpRes := p.applyRequestPolicy(requestPolicyInput{
 				Host:        req.URL.Hostname(),
 				Method:      req.Method,
+				Config:      currentCfg,
 				Path:        req.URL.EscapedPath(),
 				Query:       req.URL.RawQuery,
 				ContentType: req.Header.Get(headerContentType),
@@ -1252,6 +1266,10 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				},
 			}); rpRes.Block {
 				return newRedirectBlockedRequest(blockLayerRequestPolicy, rpRes.Reason)
+			} else if rpRes.Observed {
+				if flag, ok := req.Context().Value(ctxKeyRequestPolicyObserved).(*atomic.Bool); ok && flag != nil {
+					flag.Store(true)
+				}
 			}
 
 			contractLoader, _ := req.Context().Value(ctxKeyAgentContractLoader).(*contractruntime.Loader)
@@ -4159,6 +4177,17 @@ func emitAdaptiveResidualExpiries(sess *SessionState, expired []adaptiveResidual
 	}
 }
 
+// responseDenialReason is the adaptive denial fingerprint for a blocked
+// response. It names each matched pattern once, sorted, so a page that repeats
+// a pattern, or lists the same patterns in another order, keeps the same
+// fingerprint and a retry of the same finding scores once. Logs and approval
+// prompts keep the full ordered match list.
+func responseDenialReason(patternNames []string) string {
+	names := slices.Clone(patternNames)
+	slices.Sort(names)
+	return "response injection: " + strings.Join(slices.Compact(names), ", ")
+}
+
 func firstNonEmptyString(values ...string) string {
 	for _, value := range values {
 		if value != "" {
@@ -6206,6 +6235,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
 				Result: ceeRes, Sessions: sm, SessionKey: sessionKey,
 				AdaptiveCfg: &admission.AdaptiveConfig, Logger: log, Metrics: p.metrics,
+				Scope:    adaptiveScopeForHost(parsed.Hostname()),
 				ClientIP: clientIP, RequestID: requestID,
 			})
 		}
@@ -6264,7 +6294,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 					FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: session.ErrCapacity.Error(), Layer: sessionCapacityLayer})
 				return
 			}
-			level := recEscalationLevel(ceeRec)
+			_, level := adaptiveBlockState(ceeRec, adaptiveScopeForHost(parsed.Hostname()))
 			recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
 			emitFetchReceipt(receipt.EmitOpts{
 				ActionID:            receipt.NewActionID(),
@@ -6305,9 +6335,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// headers; the agent's inbound /fetch control-plane headers (Content-Type,
 	// X-HTTP-Method-Override) never reach the upstream, so they must not drive
 	// request_policy matching. Leave Headers/ContentType unset.
+	policyObserved := new(atomic.Bool)
 	if rpRes := p.applyRequestPolicy(requestPolicyInput{
 		Host:      parsed.Hostname(),
 		Method:    http.MethodGet,
+		Config:    cfg,
 		Path:      parsed.EscapedPath(),
 		Query:     parsed.RawQuery,
 		BodyRead:  true,
@@ -6328,6 +6360,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			BlockReason: "blocked by request policy: " + rpRes.Reason,
 		})
 		return
+	} else if rpRes.Observed {
+		policyObserved.Store(true)
 	}
 
 	killSwitchActive := false
@@ -6432,6 +6466,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
 	redirectExempt := new(atomic.Bool)
 	ctx = context.WithValue(ctx, ctxKeyRedirectStructuralExemption, redirectExempt)
+	ctx = context.WithValue(ctx, ctxKeyRequestPolicyObserved, policyObserved)
 	ctx = context.WithValue(ctx, ctxKeyReceiptShard, selectedReceiptShard)
 	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
 	if fetchAirlockSess != nil {
@@ -7099,7 +7134,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// This ensures warn/near-miss findings do not inadvertently decay score.
 	// A structural exemption (a valid presigned or GitHub-issued SAS URL) is
 	// adaptive-neutral: it neither raises the score nor earns clean credit.
-	if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !result.IsStructuralExemption() && !redirectExempt.Load() {
+	if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !result.IsStructuralExemption() && !redirectExempt.Load() && !policyObserved.Load() {
 		fetchScope := adaptiveScopeForHost(finalHost)
 		recordCleanForAdaptiveScope(fetchRec, fetchScope, &cfg.AdaptiveEnforcement, sc.ResponseScanningEnabled() && !responseScanExempt, adaptiveRecoveryContext{
 			assessment: scanned.result.RecoveryAssessment(),
@@ -7323,12 +7358,15 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 			sessionKey := sessionKeyFor(cfg, agent, clientIP, actorAuth)
 			sess := sm.GetOrCreate(sessionKey)
 			recordAdaptiveSignalForScope(sess, responseScope, sig, &cfg.AdaptiveEnforcement, &cfg.Airlock, decide.EscalationParams{
-				Threshold: cfg.AdaptiveEnforcement.EscalationThreshold,
-				Logger:    log,
-				Metrics:   p.metrics,
-				Session:   sessionKey,
-				ClientIP:  clientIP,
-				RequestID: requestID,
+				Threshold:     cfg.AdaptiveEnforcement.EscalationThreshold,
+				Logger:        log,
+				Metrics:       p.metrics,
+				Session:       sessionKey,
+				ClientIP:      clientIP,
+				RequestID:     requestID,
+				DenialScanner: responseScanLayer,
+				DenialReason:  responseDenialReason(patternNames),
+				PolicyHash:    cfg.CanonicalPolicyHash(),
 			})
 		}
 	}
